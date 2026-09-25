@@ -40,7 +40,7 @@ in
   systemd.services.pifinder-differ = {
     description = "PiFinder delta (zstd --patch-from) server";
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" ];
+    after = [ "network-online.target" "atticd.service" ];
     wants = [ "network-online.target" ];
 
     # curl fetches NARs from loopback atticd, zstd patches, df disk guard.
@@ -62,21 +62,31 @@ in
 
     serviceConfig = {
       ExecStart = "${pifinder-differ}/bin/pifinder-differ";
-      StateDirectory = "pifinder-differ";
+      # atticd's state directory holds server.db (see User below).
+      StateDirectory = [ "pifinder-differ" "atticd" ];
       Restart = "on-failure";
       RestartSec = 5;
 
-      # Runs as root only because /var/lib/atticd is 0700 root:root and the
-      # differ reads server.db in there. It needs no capability for that
-      # (root owns the files), so all capabilities are dropped. SQLite may
-      # write the -shm/-wal files beside server.db, so /var stays writable.
-      # The atticd secrets are hidden from this service. A dedicated user
-      # with a group on the atticd dir would let this drop root entirely.
+      # Runs as the atticd dynamic user. server.db and its WAL files belong
+      # to that user (mode 0600, under the 0700 /var/lib/private), and a WAL
+      # reader must write server.db-shm. systemd shares one dynamic user
+      # between units with the same User=, and StateDirectory makes
+      # /var/lib/atticd reachable here. So the differ needs no root and no
+      # capability. DynamicUser also implies ProtectSystem=strict.
+      # env holds the S3 keys and the JWT secret and belongs to atticd, so it
+      # is hidden. The cache signing keys live inside server.db, so the differ
+      # can still read them.
+      DynamicUser = true;
+      User = config.services.atticd.user;
+      Group = config.services.atticd.group;
       CapabilityBoundingSet = "";
       AmbientCapabilities = "";
       NoNewPrivileges = true;
-      InaccessiblePaths = [ "-/var/lib/atticd/env" "-/var/lib/atticd/ci-token" ];
-      ProtectSystem = "full";
+      InaccessiblePaths = [
+        "-/var/lib/atticd/env"
+        "-/var/lib/atticd/ci-token"
+        "-/var/lib/atticd/.pifinder-vkem-keypair.bak"
+      ];
       ProtectHome = true;
       PrivateTmp = true;
       PrivateDevices = true;

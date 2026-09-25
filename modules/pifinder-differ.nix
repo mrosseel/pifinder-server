@@ -113,4 +113,45 @@ in
       MemoryMax = "3G";
     };
   };
+
+  # Pre-warm: when a manifest entry moves to a new build (a PR or trunk
+  # rebuild, or a new release), ask the differ on loopback to compute the
+  # patches from the old build to the new one, so devices get them at once.
+  # /warm stays loopback-only; this runs on the same host.
+  systemd.services.pifinder-differ-warm = {
+    description = "Pre-warm pifinder-differ for new PiFinder builds";
+    after = [ "pifinder-differ.service" "network-online.target" ];
+    wants = [ "network-online.target" ];
+    environment = {
+      WARM_DIFFER_URL = "http://127.0.0.1:8090";
+      WARM_MANIFESTS = lib.concatStringsSep " " [
+        "https://raw.githubusercontent.com/brickbots/PiFinder/nixos-manifest/update-manifest.json"
+        "https://raw.githubusercontent.com/mrosseel/PiFinder/nixos-manifest/update-manifest.json"
+      ];
+    };
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.python3}/bin/python3 ${./differ-warm.py}";
+      DynamicUser = true;
+      StateDirectory = "pifinder-differ-warm";
+      CapabilityBoundingSet = "";
+      NoNewPrivileges = true;
+      PrivateDevices = true;
+      ProtectHome = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectControlGroups = true;
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+      SystemCallFilter = [ "@system-service" ];
+      Nice = 19;
+    };
+  };
+
+  systemd.timers.pifinder-differ-warm = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "2min";
+      OnUnitActiveSec = "5min";
+    };
+  };
 }

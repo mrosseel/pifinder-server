@@ -1,7 +1,7 @@
 { config, lib, pkgs, ... }:
 
 # pifinder-differ — on-demand + self-warming zstd delta server for PiFinder
-# NixOS updates. Decision record: docs/adr/0031-delta-updates-on-demand-differ.md
+# NixOS updates. Decision record: docs/adr/0036-delta-updates-on-demand-differ.md
 # in the PiFinder repo (nixos branch). Sits beside Attic (modules/attic.nix)
 # and serves byte-level patches between store-path NARs:
 #
@@ -18,8 +18,8 @@
 # its base with `nix-store --dump`), so GC holes in the cache degrade
 # per-path instead of failing whole closures.
 #
-# Test phase: bound to loopback only — reach it via SSH port-forward or
-# curl on the host. No Caddy vhost until the device-side applier lands.
+# Listens on loopback. The host's Caddy vhost (docs/caddy.md) exposes only
+# /update-start, /delta, /blobs/* and /health.
 #
 # The server hosts other apps. All compute is idle-priority and one core is
 # always left free: 2 workers on this 4-core / 6 GiB machine (zstd -19
@@ -66,10 +66,34 @@ in
       Restart = "on-failure";
       RestartSec = 5;
 
-      # Root only because /var/lib/atticd is 0700 root:root and the differ
-      # reads server.db in there. Nothing else needs privilege any more
-      # (v0.2 dropped all nix-store use) — a dedicated user + a group on
-      # the atticd dir would let this drop root entirely.
+      # Runs as root only because /var/lib/atticd is 0700 root:root and the
+      # differ reads server.db in there. It needs no capability for that
+      # (root owns the files), so all capabilities are dropped. SQLite may
+      # write the -shm/-wal files beside server.db, so /var stays writable.
+      # The atticd secrets are hidden from this service. A dedicated user
+      # with a group on the atticd dir would let this drop root entirely.
+      CapabilityBoundingSet = "";
+      AmbientCapabilities = "";
+      NoNewPrivileges = true;
+      InaccessiblePaths = [ "-/var/lib/atticd/env" "-/var/lib/atticd/ci-token" ];
+      ProtectSystem = "full";
+      ProtectHome = true;
+      PrivateTmp = true;
+      PrivateDevices = true;
+      ProtectKernelTunables = true;
+      ProtectKernelModules = true;
+      ProtectKernelLogs = true;
+      ProtectControlGroups = true;
+      ProtectClock = true;
+      ProtectHostname = true;
+      RestrictNamespaces = true;
+      RestrictRealtime = true;
+      RestrictSUIDSGID = true;
+      LockPersonality = true;
+      MemoryDenyWriteExecute = true;
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+      SystemCallArchitectures = "native";
+      SystemCallFilter = [ "@system-service" ];
 
       # Never compete with the co-hosted services.
       Nice = 19;

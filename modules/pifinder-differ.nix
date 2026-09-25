@@ -125,8 +125,8 @@ in
     environment = {
       WARM_DIFFER_URL = "http://127.0.0.1:8090";
       WARM_MANIFESTS = lib.concatStringsSep " " [
-        "https://raw.githubusercontent.com/brickbots/PiFinder/nixos-manifest/update-manifest.json"
-        "https://raw.githubusercontent.com/mrosseel/PiFinder/nixos-manifest/update-manifest.json"
+        "https://api.github.com/repos/brickbots/PiFinder/contents/update-manifest.json?ref=nixos-manifest"
+        "https://api.github.com/repos/mrosseel/PiFinder/contents/update-manifest.json?ref=nixos-manifest"
       ];
     };
     serviceConfig = {
@@ -151,7 +151,7 @@ in
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnBootSec = "2min";
-      OnUnitActiveSec = "5min";
+      OnUnitActiveSec = "1min";
     };
   };
 }

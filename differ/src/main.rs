@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::{Path as AxPath, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -83,6 +83,9 @@ const RL_MAX_TRACKED_IPS: usize = 10_000;
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 const SESSION_SLACK: i64 = 200; // headroom over 2×closure for retries
 const MAX_SESSIONS: usize = 10_000;
+const MAX_CLOSURES: usize = 256;
+// The device sends 3 candidate bases; more only costs chunk-overlap queries.
+const MAX_BASES: usize = 8;
 
 // ---------------------------------------------------------------- state
 
@@ -105,6 +108,9 @@ struct App {
     warm_seq: AtomicU64,
     rate: Mutex<HashMap<String, TokenBucket>>,
     sessions: Mutex<HashMap<String, Session>>,
+    // Closure store-path hashes per target toplevel hash, shared by every
+    // session for that toplevel. Bounded by MAX_CLOSURES.
+    closures: Mutex<HashMap<String, Arc<HashSet<String>>>>,
     rate_limited: AtomicU64,
 }
 
@@ -116,6 +122,8 @@ struct TokenBucket {
 struct Session {
     budget: i64,
     expires: Instant,
+    // Store-path hashes of the target closure: /delta serves only these.
+    closure: Arc<HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -774,7 +782,7 @@ fn session_spend(app: &App, token: &str) -> bool {
     }
 }
 
-fn new_session(app: &App, budget: i64) -> String {
+fn new_session(app: &App, budget: i64, closure: Arc<HashSet<String>>) -> String {
     let mut raw = [0u8; 16];
     // /dev/urandom: no rng dependency, and this is an ephemeral token.
     use std::io::Read;
@@ -790,7 +798,7 @@ fn new_session(app: &App, budget: i64) -> String {
             sessions.clear(); // rotating attacker: reset rather than grow
         }
     }
-    sessions.insert(token.clone(), Session { budget, expires: now + SESSION_TTL });
+    sessions.insert(token.clone(), Session { budget, expires: now + SESSION_TTL, closure });
     token
 }
 
@@ -852,7 +860,21 @@ async fn post_update_start(
         }
     };
     let budget = 2 * closure.len() as i64 + SESSION_SLACK;
-    let token = new_session(&app, budget);
+    let hashes = {
+        let mut closures = app.closures.lock().unwrap();
+        if closures.len() >= MAX_CLOSURES && !closures.contains_key(&sph) {
+            closures.clear();
+        }
+        closures
+            .entry(sph.clone())
+            .or_insert_with(|| {
+                Arc::new(
+                    closure.iter().filter_map(|p| split_store_path(p)).map(|(h, _)| h).collect(),
+                )
+            })
+            .clone()
+    };
+    let token = new_session(&app, budget, hashes);
     Json(serde_json::json!({
         "session": token,
         "budget": budget,
@@ -882,12 +904,36 @@ struct DeltaHit {
     deriver: Option<String>,
 }
 
-async fn post_delta(State(app): State<Arc<App>>, Json(req): Json<DeltaReq>) -> Response {
+async fn post_delta(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<DeltaReq>,
+) -> Response {
     let Some((t_hash, _)) = split_store_path(&req.target) else {
         return (StatusCode::BAD_REQUEST, "target is not a store path").into_response();
     };
-    let bases: Vec<String> =
-        req.bases.iter().filter(|b| split_store_path(b).is_some()).cloned().collect();
+    // Public requests carry a session (rate_limit_mw refuses them otherwise);
+    // a request without one is direct loopback ops traffic.
+    if let Some(token) = headers.get("x-update-session").and_then(|v| v.to_str().ok()) {
+        let in_closure = app
+            .sessions
+            .lock()
+            .unwrap()
+            .get(token)
+            .map(|s| s.closure.contains(&t_hash))
+            .unwrap_or(false);
+        if !in_closure {
+            return (StatusCode::FORBIDDEN, "target not in this session's closure")
+                .into_response();
+        }
+    }
+    let bases: Vec<String> = req
+        .bases
+        .iter()
+        .filter(|b| split_store_path(b).is_some())
+        .take(MAX_BASES)
+        .cloned()
+        .collect();
     if bases.is_empty() {
         return (StatusCode::BAD_REQUEST, "no valid bases").into_response();
     }
@@ -1061,14 +1107,17 @@ async fn get_status(State(app): State<Arc<App>>) -> Response {
     .into_response()
 }
 
-async fn get_blob(State(app): State<Arc<App>>, AxPath(name): AxPath<String>) -> Response {
-    // Names are "<32hash>_<32hash>.zst" — reject anything else.
-    let ok = name.len() == 69
+/// Blob names are "<32hash>_<32hash>.zst".
+fn blob_name_ok(name: &str) -> bool {
+    name.len() == 69
         && name.ends_with(".zst")
-        && name[..65]
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !ok {
+        && name.as_bytes()[..65]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+async fn get_blob(State(app): State<Arc<App>>, AxPath(name): AxPath<String>) -> Response {
+    if !blob_name_ok(&name) {
         return StatusCode::NOT_FOUND.into_response();
     }
     match tokio::fs::File::open(app.blob_dir.join(&name)).await {
@@ -1136,6 +1185,7 @@ async fn main() -> Result<()> {
         warm_seq: AtomicU64::new(0),
         rate: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        closures: Mutex::new(HashMap::new()),
         rate_limited: AtomicU64::new(0),
     });
     for d in [&app.blob_dir, &app.meta_dir, &app.tmp_dir, &app.nar_cache_dir] {
@@ -1171,4 +1221,51 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: &str = "1xm0hcqksxfy24p8m2xsfdas7wvyga76";
+
+    #[test]
+    fn split_store_path_accepts_a_store_path() {
+        let (hash, name) = split_store_path(&format!("/nix/store/{H}-testpkg-1.1")).unwrap();
+        assert_eq!(hash, H);
+        assert_eq!(name, "testpkg-1.1");
+    }
+
+    #[test]
+    fn split_store_path_rejects_bad_input() {
+        for bad in [
+            format!("/nix/store/{H}"),
+            format!("/nix/store/{H}-"),
+            format!("/nix/store/{H}-x/etc/passwd"),
+            format!("/tmp/{H}-x"),
+            "/nix/store/UPPERCASEUPPERCASEUPPERCASEUPPER-x".to_string(),
+            "/nix/store/é".to_string(),
+        ] {
+            assert!(split_store_path(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn blob_name_ok_accepts_pair_names() {
+        assert!(blob_name_ok(&format!("{H}_{H}.zst")));
+    }
+
+    #[test]
+    fn blob_name_ok_rejects_other_names() {
+        let non_ascii = format!("{}é.zst", "a".repeat(63));
+        assert_eq!(non_ascii.len(), 69);
+        for bad in [
+            non_ascii,
+            format!("{H}_{H}.txt"),
+            format!("../{H}_{H}.zst"),
+            format!("{H}-{H}.zst"),
+        ] {
+            assert!(!blob_name_ok(&bad), "{bad}");
+        }
+    }
 }

@@ -6,8 +6,14 @@ it in its channel, it asks the differ (POST /warm on loopback) to compute the
 patches from the old build to the new one. Devices that upgrade along that
 step then get their patches at once instead of a 202 "computing".
 
-State (which store path each label had, and which pairs were warmed) lives in
-$STATE_DIRECTORY/seen.json. Standard library only.
+The manifests are read through the GitHub contents API, not
+raw.githubusercontent.com, whose CDN serves a branch file up to 5 minutes
+stale. Each request sends the last ETag; a 304 answer does not count against
+the unauthenticated limit of 60 requests per hour, so a 1-minute timer fits.
+
+State (which store path each label had, which pairs were warmed, and the last
+ETag and body per manifest) lives in $STATE_DIRECTORY/seen.json. Standard
+library only.
 """
 
 import json
@@ -25,9 +31,22 @@ STORE_PATH = re.compile(r"/nix/store/[a-z0-9]{32}-[^/]+")
 MAX_WARMED = 500
 
 
-def fetch_json(url: str):
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        return json.load(resp)
+def fetch_json(url: str, cached: dict):
+    """The manifest at `url`. `cached` holds the last ETag and body for it and
+    is updated; a 304 answer reuses the cached body."""
+    headers = {"accept": "application/vnd.github.raw+json"}
+    if cached.get("etag"):
+        headers["if-none-match"] = cached["etag"]
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode()
+            cached["etag"] = resp.headers.get("etag", "")
+            cached["body"] = body
+    except urllib.error.HTTPError as exc:
+        if exc.code != 304 or "body" not in cached:
+            raise
+    return json.loads(cached["body"])
 
 
 def warm(base: str, target: str) -> bool:
@@ -61,7 +80,7 @@ def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text())
     except (OSError, ValueError):
-        return {"seen": {}, "warmed": []}
+        return {"seen": {}, "warmed": [], "manifests": {}}
 
 
 def main() -> None:
@@ -69,11 +88,12 @@ def main() -> None:
     seen: dict = state.get("seen", {})
     # Oldest first, so the list can be cut from the front.
     warmed = [tuple(p) for p in state.get("warmed", [])]
+    manifests: dict = state.get("manifests", {})
     pairs: set = set()
 
     for url in MANIFESTS:
         try:
-            manifest = fetch_json(url)
+            manifest = fetch_json(url, manifests.setdefault(url, {}))
         except (urllib.error.URLError, OSError, ValueError) as exc:
             print(f"manifest {url}: {exc}")
             continue
@@ -100,7 +120,7 @@ def main() -> None:
             print(f"warming {base} -> {target}")
             warmed.append((base, target))
 
-    state = {"seen": seen, "warmed": warmed[-MAX_WARMED:]}
+    state = {"seen": seen, "warmed": warmed[-MAX_WARMED:], "manifests": manifests}
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1))
     tmp.replace(STATE_FILE)

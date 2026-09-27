@@ -11,7 +11,7 @@
 #   GET  /status  queues, counters, warm-run progress
 #   GET  /blobs/* the patch blobs
 #
-# v0.2 works from the cache itself, not from a nix store: closures,
+# v0.2+ works from the cache itself, not from a nix store: closures,
 # references and chunk lists come from atticd's SQLite DB (read-only),
 # candidate bases are ranked by FastCDC chunk overlap, and NAR bytes are
 # fetched from atticd over loopback. Patches are NAR-to-NAR (device dumps
@@ -28,7 +28,7 @@
 let
   pifinder-differ = pkgs.rustPlatform.buildRustPackage {
     pname = "pifinder-differ";
-    version = "0.3.0";
+    version = "0.4.0";
     src = lib.cleanSourceWith {
       src = ../differ;
       filter = path: _type: builtins.baseNameOf path != "target";
@@ -43,8 +43,9 @@ in
     after = [ "network-online.target" "atticd.service" ];
     wants = [ "network-online.target" ];
 
-    # curl fetches NARs from loopback atticd, zstd patches, df disk guard.
-    path = [ pkgs.curl pkgs.zstd pkgs.coreutils pkgs.bash ];
+    # curl fetches NARs from loopback atticd and from cache.nixos.org, zstd
+    # patches, xz/bzip2 decode upstream NARs, df disk guard.
+    path = [ pkgs.curl pkgs.zstd pkgs.xz pkgs.bzip2 pkgs.coreutils pkgs.bash ];
 
     environment = {
       DIFFER_LISTEN = "127.0.0.1:8090";
@@ -53,6 +54,9 @@ in
       DIFFER_ATTIC_URL = "http://127.0.0.1:8080";
       DIFFER_ATTIC_DB = "/var/lib/atticd/server.db";
       DIFFER_CACHES = "pifinder pifinder-release";
+      # `attic push` skips paths that cache.nixos.org has. The differ reads
+      # those narinfos and NARs from there, so nixpkgs paths get patches too.
+      DIFFER_UPSTREAM_URL = "https://cache.nixos.org";
       # Local LRU cache of decompressed NARs under the state dir. v0.2 was
       # S3-fetch-bound (~600 s for one 202 MiB pair); with the release lane's
       # working set (~1 GiB per toplevel diff) this holds ~10 diffs. Disk has

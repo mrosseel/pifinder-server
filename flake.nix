@@ -28,7 +28,7 @@
       packages = forSystems (pkgs: rec {
         pifinder-differ = pkgs.rustPlatform.buildRustPackage {
           pname = "pifinder-differ";
-          version = "0.3.0";
+          version = "0.4.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./differ;
             filter = path: _type: builtins.baseNameOf path != "target";

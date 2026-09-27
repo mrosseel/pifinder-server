@@ -1,23 +1,33 @@
-// pifinder-differ v0.2 — on-demand + self-warming binary delta server for the
+// pifinder-differ v0.4 — on-demand + self-warming binary delta server for the
 // PiFinder NixOS update transport.
 //
-// Runs beside atticd and works from the cache itself, not from a nix store:
+// Runs beside atticd and works from the caches themselves, not from a nix store:
 //   - metadata (closures, references, NAR sizes) comes from atticd's SQLite
-//     database, opened read-only;
+//     database, opened read-only. `attic push` skips paths that the upstream
+//     cache (cache.nixos.org) already has, so the paths that attic does not
+//     hold come from the upstream narinfo, kept on disk;
 //   - candidate bases are ranked by FastCDC chunk overlap (Jaccard) straight
-//     from the DB — no bytes fetched to pick a winner;
-//   - NAR bytes are fetched from atticd over loopback and patched NAR-to-NAR
-//     with zstd --patch-from. NARs are canonical on both ends (`nix-store
-//     --dump` on the device), so no export-stream/deriver nondeterminism.
+//     from the DB — no bytes fetched to pick a winner. Upstream paths have no
+//     chunk list and rank by NAR size closeness;
+//   - NAR bytes are fetched from atticd over loopback or from the upstream
+//     cache, and patched NAR-to-NAR with zstd --patch-from. NARs are
+//     canonical on both ends (`nix-store --dump` on the device), so no
+//     export-stream/deriver nondeterminism.
+//
+// Every pair is first patched at FAST_LEVEL, so a device gets it in seconds.
+// A refine job then patches the same pair again at the final level and
+// replaces the blob when the result is smaller.
 //
 // Endpoints:
+//   POST /update-start — open a session; an optional base_toplevel starts
+//                  a warm run for exactly that step, in the demand lane
 //   POST /delta  — a device names a target and the bases it holds (demand)
 //   POST /warm   — enqueue every stem-paired path between two toplevels
 //   GET  /pairs  — every computed pair with sizes/ratios
 //   GET  /status — queues, counters, warm-run progress
 //   GET  /blobs/<base>_<target>.zst
 //
-// Demand jobs always run before warm jobs. All compute runs at the unit's
+// Demand jobs always run before warm jobs, and warm jobs before refine jobs. All compute runs at the unit's
 // idle CPU/IO priority so co-hosted services are never starved.
 //
 // Device applies a patch as:
@@ -48,6 +58,9 @@ use tokio::process::Command;
 const ALGO: &str = "zstd-patch-from-nar-v2";
 const MIN_WINDOW_LOG: u32 = 27; // 128 MiB floor; raised per pair when NARs are bigger
 const MAX_WINDOW_LOG: u32 = 30; // 1 GiB — refuse pairs the device could never decode
+// First pass. On a 134 MiB python NAR: level 3 takes 0.4 s for a 41.6 MB
+// patch, level 19 takes 40 s for 39.0 MB. The refine pass makes up the rest.
+const FAST_LEVEL: u32 = 3;
 const FINAL_LEVEL_SMALL: u32 = 19; // targets below the split
 const FINAL_LEVEL_LARGE: u32 = 12; // large targets: 19 costs minutes for ~% gain
 const LARGE_TARGET_BYTES: u64 = 20 * 1024 * 1024;
@@ -64,8 +77,19 @@ const KEEP_RATIO: f64 = 0.40; // patch bigger than 40% of the NAR: not worth it
 const MIN_CHUNK_OVERLAP: f64 = 0.05;
 const MIN_CHUNKS_FOR_OVERLAP: usize = 8;
 const MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-const DEMAND_QUEUE_CAP: usize = 64;
+// A full nixpkgs step changes about 500 paths; the device asks for all of
+// them in one round, and a 503 makes it download the rest in full.
+const DEMAND_QUEUE_CAP: usize = 512;
 const WARM_QUEUE_CAP: usize = 10_000;
+const REFINE_QUEUE_CAP: usize = 10_000;
+// Upstream narinfo lookups: parallel transfers per curl call, URLs per call,
+// and how long a "not there" answer is kept in memory.
+const UPSTREAM_PARALLEL: usize = 32;
+const UPSTREAM_BATCH: usize = 256;
+const UPSTREAM_NEGATIVE_TTL: Duration = Duration::from_secs(3600);
+const UPSTREAM_MEM_MAX: usize = 100_000;
+// A device's base_toplevel starts one warm run per step, not one per session.
+const PRIORITY_WARM_TTL: Duration = Duration::from_secs(3600);
 
 // Rate limiting is budgeted PER UPDATE, not per IP: a device opens a session
 // naming its target toplevel, and the session's request budget is derived
@@ -98,10 +122,20 @@ struct App {
     attic_url: String,
     attic_db: PathBuf,
     caches: Vec<String>,
+    // Upstream binary cache for paths attic does not hold; empty = off.
+    upstream_url: String,
+    upstream_dir: PathBuf, // narinfo files, one per store path hash
+    // Upstream lookups: Some = found, None = not there (expires after
+    // UPSTREAM_NEGATIVE_TTL). Bounded by UPSTREAM_MEM_MAX.
+    upstream_mem: Mutex<HashMap<String, (Instant, Option<StoreObject>)>>,
+    fetch_seq: AtomicU64,
     db: Mutex<Option<Connection>>,
     demand: Mutex<VecDeque<Job>>,
     warm: Mutex<VecDeque<Job>>,
+    refine: Mutex<VecDeque<Job>>,
     inflight: Mutex<HashSet<String>>, // target hashes being computed
+    // (base, target) toplevel pairs warmed on a device's request, and when.
+    priority_warms: Mutex<HashMap<(String, String), Instant>>,
     warm_runs: Mutex<Vec<WarmRun>>,
     jobs_done: AtomicU64,
     jobs_failed: AtomicU64,
@@ -130,7 +164,7 @@ struct Session {
 struct Job {
     target: String,       // full /nix/store/... path
     bases: Vec<String>,   // candidate bases, full paths, best guess first
-    source: &'static str, // "demand" | "warm"
+    source: &'static str, // "demand" | "warm" | "refine"
 }
 
 #[derive(Clone, Serialize)]
@@ -139,6 +173,7 @@ struct WarmRun {
     base_toplevel: String,
     target_toplevel: String,
     state: String, // pairing | queued | failed
+    priority: bool, // started by a device's /update-start
     paired: usize,
     skipped_existing: usize,
     unpaired: usize,
@@ -160,8 +195,14 @@ struct PairMeta {
     references: Vec<String>, // full store paths of the target's references
     #[serde(default)]
     deriver: Option<String>,
+    // Jaccard overlap of the chosen base, for observability; -1 = not
+    // measured (an upstream path has no chunk list).
     #[serde(default)]
-    chunk_overlap: f64, // Jaccard overlap of the chosen base, for observability
+    chunk_overlap: f64,
+    // The refine pass ran. The blob is its result, or the fast one when the
+    // refined patch was not smaller.
+    #[serde(default)]
+    refined: bool,
     compute_ms: u64,
     rank_ms: u64,
     candidates_ranked: usize,
@@ -170,14 +211,22 @@ struct PairMeta {
     rejected: bool, // true: patch exceeded KEEP_RATIO, no blob kept
 }
 
-// Row from attic's `object` × `nar` tables.
-struct AtticObject {
+// Where a store path's NAR comes from.
+#[derive(Clone, Debug, PartialEq)]
+enum Origin {
+    // A row of attic's `object` × `nar` tables.
+    Attic { cache: String, nar_id: i64 },
+    // The upstream cache; `url` is relative to upstream_url.
+    Upstream { url: String, compression: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StoreObject {
     store_path: String,
     references: Vec<String>, // basenames ("<hash>-<name>")
     deriver: Option<String>,
-    nar_id: i64,
     nar_size: u64,
-    cache: String,
+    origin: Origin,
 }
 
 // ---------------------------------------------------------------- helpers
@@ -303,7 +352,7 @@ fn with_db<T>(app: &App, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> 
 }
 
 /// Look up a store path hash in the allowed caches, first cache wins.
-fn attic_object(app: &App, sph: &str) -> Result<Option<AtticObject>> {
+fn attic_object(app: &App, sph: &str) -> Result<Option<StoreObject>> {
     with_db(app, |conn| {
         let mut stmt = conn.prepare_cached(
             "SELECT o.store_path, o.\"references\", o.deriver, o.nar_id,
@@ -321,29 +370,201 @@ fn attic_object(app: &App, sph: &str) -> Result<Option<AtticObject>> {
         Ok(rows)
     })
     .map(|rows| {
-        let mut best: Option<AtticObject> = None;
+        let mut best: Option<(usize, StoreObject)> = None;
         for (store_path, refs_json, deriver, nar_id, nar_size, cache) in rows {
             let rank = app.caches.iter().position(|c| *c == cache);
             let Some(rank) = rank else { continue };
-            let current_rank = best
-                .as_ref()
-                .and_then(|b| app.caches.iter().position(|c| *c == b.cache))
-                .unwrap_or(usize::MAX);
-            if rank < current_rank {
+            if best.as_ref().map(|(r, _)| rank < *r).unwrap_or(true) {
                 let references: Vec<String> =
                     serde_json::from_str(&refs_json).unwrap_or_default();
-                best = Some(AtticObject {
-                    store_path,
-                    references,
-                    deriver,
-                    nar_id,
-                    nar_size: nar_size.max(0) as u64,
-                    cache,
-                });
+                best = Some((
+                    rank,
+                    StoreObject {
+                        store_path,
+                        references,
+                        deriver,
+                        nar_size: nar_size.max(0) as u64,
+                        origin: Origin::Attic { cache, nar_id },
+                    },
+                ));
             }
         }
-        best
+        best.map(|(_, obj)| obj)
     })
+}
+
+// ---------------------------------------------------------------- upstream
+
+/// Parse an upstream .narinfo. None if it is not for `sph` or lacks a field
+/// the differ needs.
+fn parse_narinfo(text: &str, sph: &str) -> Option<StoreObject> {
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).and_then(|v| v.strip_prefix(": ")))
+            .map(|v| v.trim().to_string())
+    };
+    let store_path = field("StorePath")?;
+    let (hash, _) = split_store_path(&store_path)?;
+    if hash != sph {
+        return None;
+    }
+    let url = field("URL")?;
+    if url.is_empty() || url.contains("..") || url.starts_with('/') || url.contains("://") {
+        return None;
+    }
+    let nar_size = field("NarSize")?.parse::<u64>().ok()?;
+    let references = field("References")
+        .map(|v| v.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+    let deriver = field("Deriver").filter(|d| !d.is_empty() && d != "unknown-deriver");
+    Some(StoreObject {
+        store_path,
+        references,
+        deriver,
+        nar_size,
+        origin: Origin::Upstream {
+            url,
+            compression: field("Compression").unwrap_or_else(|| "none".into()),
+        },
+    })
+}
+
+/// Upstream objects for `hashes`, from memory, the narinfo files on disk,
+/// or the upstream cache. A narinfo never changes for a store path hash, so
+/// a found one is kept on disk for good. Hashes that are not upstream, or
+/// that failed to fetch, are left out of the result.
+async fn upstream_objects(app: &App, hashes: &[String]) -> Result<HashMap<String, StoreObject>> {
+    let mut found: HashMap<String, StoreObject> = HashMap::new();
+    if app.upstream_url.is_empty() {
+        return Ok(found);
+    }
+    let mut todo: Vec<String> = Vec::new();
+    {
+        let mem = app.upstream_mem.lock().unwrap();
+        let now = Instant::now();
+        for h in hashes {
+            match mem.get(h) {
+                Some((_, Some(obj))) => {
+                    found.insert(h.clone(), obj.clone());
+                }
+                Some((at, None)) if now.duration_since(*at) < UPSTREAM_NEGATIVE_TTL => {}
+                _ => todo.push(h.clone()),
+            }
+        }
+    }
+    let mut fetch: Vec<String> = Vec::new();
+    for h in todo {
+        let file = app.upstream_dir.join(format!("{h}.narinfo"));
+        match tokio::fs::read_to_string(&file).await {
+            Ok(text) => match parse_narinfo(&text, &h) {
+                Some(obj) => {
+                    upstream_remember(app, &h, Some(obj.clone()));
+                    found.insert(h, obj);
+                }
+                None => {
+                    let _ = tokio::fs::remove_file(&file).await;
+                    fetch.push(h);
+                }
+            },
+            Err(_) => fetch.push(h),
+        }
+    }
+    for batch in fetch.chunks(UPSTREAM_BATCH) {
+        for (h, obj) in upstream_fetch(app, batch).await? {
+            found.insert(h, obj);
+        }
+    }
+    Ok(found)
+}
+
+fn upstream_remember(app: &App, sph: &str, obj: Option<StoreObject>) {
+    let mut mem = app.upstream_mem.lock().unwrap();
+    if mem.len() >= UPSTREAM_MEM_MAX && !mem.contains_key(sph) {
+        mem.clear();
+    }
+    mem.insert(sph.to_string(), (Instant::now(), obj));
+}
+
+/// One curl call fetches the narinfos for `hashes` in parallel. A 404 is
+/// remembered as "not upstream"; a network error is not remembered.
+async fn upstream_fetch(app: &App, hashes: &[String]) -> Result<Vec<(String, StoreObject)>> {
+    let seq = app.fetch_seq.fetch_add(1, Ordering::Relaxed);
+    let dir = app.tmp_dir.join(format!("narinfo-{seq}"));
+    tokio::fs::create_dir_all(&dir).await?;
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "--fail", "--parallel"])
+        .arg(format!("--parallel-max={UPSTREAM_PARALLEL}"))
+        .args(["--max-time", "30", "--write-out", "%{http_code} %{filename_effective}\n"]);
+    for h in hashes {
+        cmd.arg("-o").arg(dir.join(format!("{h}.narinfo")));
+        cmd.arg(format!("{}/{h}.narinfo", app.upstream_url));
+    }
+    // --fail makes curl exit non-zero when any URL is a 404, so the exit
+    // status says nothing. The per-transfer lines say which one.
+    let out = cmd
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .context("spawn curl for upstream narinfo")?;
+    let mut got = Vec::new();
+    let mut errors = 0usize;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((code, file)) = line.split_once(' ') else { continue };
+        let Some(h) = Path::new(file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|h| hashes.iter().any(|x| x == h))
+        else {
+            continue;
+        };
+        match code {
+            "200" => {
+                let text = tokio::fs::read_to_string(file).await.unwrap_or_default();
+                match parse_narinfo(&text, h) {
+                    Some(obj) => {
+                        let keep = app.upstream_dir.join(format!("{h}.narinfo"));
+                        if tokio::fs::rename(file, &keep).await.is_err() {
+                            let _ = tokio::fs::write(&keep, &text).await;
+                        }
+                        upstream_remember(app, h, Some(obj.clone()));
+                        got.push((h.to_string(), obj));
+                    }
+                    None => errors += 1,
+                }
+            }
+            "404" | "403" => upstream_remember(app, h, None),
+            _ => errors += 1,
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    if errors > 0 {
+        log(&format!("upstream narinfo: {errors} of {} lookups failed", hashes.len()));
+    }
+    Ok(got)
+}
+
+/// Objects for `hashes`: attic first (in the configured cache order), then
+/// the upstream cache for the rest.
+async fn find_objects(app: &App, hashes: &[String]) -> Result<HashMap<String, StoreObject>> {
+    let mut found = HashMap::new();
+    let mut rest = Vec::new();
+    for h in hashes {
+        match attic_object(app, h)? {
+            Some(obj) => {
+                found.insert(h.clone(), obj);
+            }
+            None => rest.push(h.clone()),
+        }
+    }
+    if !rest.is_empty() {
+        found.extend(upstream_objects(app, &rest).await?);
+    }
+    Ok(found)
+}
+
+async fn find_object(app: &App, sph: &str) -> Result<Option<StoreObject>> {
+    Ok(find_objects(app, &[sph.to_string()]).await?.remove(sph))
 }
 
 fn chunk_set(app: &App, nar_id: i64) -> Result<HashSet<i64>> {
@@ -366,35 +587,44 @@ fn jaccard(a: &HashSet<i64>, b: &HashSet<i64>) -> f64 {
     if union == 0.0 { 0.0 } else { inter / union }
 }
 
-/// Full runtime closure of a toplevel, walked via `references` in the DB.
-/// Returns full store paths. Paths whose object rows are missing (GC holes)
-/// are skipped — they can't be patched or fetched anyway.
-fn attic_closure(app: &App, toplevel_sph: &str) -> Result<Vec<String>> {
-    let mut seen: HashSet<String> = HashSet::new();
+/// Full runtime closure of a toplevel, walked via `references`, one level
+/// at a time so the upstream lookups of a level go out in one batch. The
+/// toplevel itself must be in attic. Returns full store paths; paths that
+/// neither attic nor upstream has (GC holes) are skipped.
+async fn closure(app: &App, toplevel_sph: &str) -> Result<Vec<String>> {
+    if attic_object(app, toplevel_sph)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut seen: HashSet<String> = HashSet::from([toplevel_sph.to_string()]);
     let mut order: Vec<String> = Vec::new();
-    let mut queue: VecDeque<String> = VecDeque::from([toplevel_sph.to_string()]);
-    let mut missing = 0usize;
-    while let Some(sph) = queue.pop_front() {
-        if !seen.insert(sph.clone()) {
-            continue;
-        }
-        match attic_object(app, &sph)? {
-            None => missing += 1,
-            Some(obj) => {
-                order.push(obj.store_path.clone());
-                for r in &obj.references {
-                    if let Some((h, _)) = split_store_path(&format!("/nix/store/{r}")) {
-                        if !seen.contains(&h) {
-                            queue.push_back(h);
-                        }
+    let mut frontier: Vec<String> = vec![toplevel_sph.to_string()];
+    let (mut missing, mut upstream) = (0usize, 0usize);
+    while !frontier.is_empty() {
+        let objs = find_objects(app, &frontier).await?;
+        let mut next = Vec::new();
+        for h in &frontier {
+            let Some(obj) = objs.get(h) else {
+                missing += 1;
+                continue;
+            };
+            if matches!(obj.origin, Origin::Upstream { .. }) {
+                upstream += 1;
+            }
+            order.push(obj.store_path.clone());
+            for r in &obj.references {
+                if let Some((rh, _)) = split_store_path(&format!("/nix/store/{r}")) {
+                    if seen.insert(rh.clone()) {
+                        next.push(rh);
                     }
                 }
             }
         }
+        frontier = next;
     }
-    if missing > 0 {
-        log(&format!("closure of {toplevel_sph}: {missing} paths missing from attic (GC holes), skipped"));
-    }
+    log(&format!(
+        "closure of {toplevel_sph}: {} paths, {upstream} from upstream, {missing} missing",
+        order.len()
+    ));
     Ok(order)
 }
 
@@ -441,20 +671,65 @@ fn nar_cache_stats(app: &App) -> (usize, u64) {
     (n, bytes)
 }
 
-/// Get a decompressed NAR, from the local LRU cache or from atticd over
-/// loopback. Returns the cache path and the NAR size.
-async fn get_nar(app: &App, cache: &str, sph: &str) -> Result<(PathBuf, u64)> {
+/// Get a decompressed NAR, from the local LRU cache, from atticd over
+/// loopback, or from the upstream cache. Returns the cache path and the NAR
+/// size.
+async fn get_nar(app: &App, obj: &StoreObject) -> Result<(PathBuf, u64)> {
+    let (sph, _) = split_store_path(&obj.store_path)
+        .ok_or_else(|| anyhow!("bad store path {}", obj.store_path))?;
     let cached = app.nar_cache_dir.join(format!("{sph}.nar"));
     if let Ok(md) = tokio::fs::metadata(&cached).await {
         // Bump mtime so LRU keeps hot NARs.
         let _ = run(Command::new("touch").arg(&cached).stdin(Stdio::null())).await;
         return Ok((cached, md.len()));
     }
-    let tmp = app.tmp_dir.join(format!("fetch-{sph}.nar"));
-    let size = fetch_nar(app, cache, sph, &tmp).await?;
+    let seq = app.fetch_seq.fetch_add(1, Ordering::Relaxed);
+    let tmp = app.tmp_dir.join(format!("fetch-{seq}-{sph}.nar"));
+    let fetched = match &obj.origin {
+        Origin::Attic { cache, .. } => fetch_nar(app, cache, &sph, &tmp).await,
+        Origin::Upstream { url, compression } => {
+            fetch_upstream_nar(app, url, compression, &tmp).await
+        }
+    };
+    let size = match fetched {
+        Ok(size) => size,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    };
+    if size != obj.nar_size {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        bail!("NAR of {} is {size} B, narinfo says {} B", obj.store_path, obj.nar_size);
+    }
     tokio::fs::rename(&tmp, &cached).await?;
     evict_nar_cache(app);
     Ok((cached, size))
+}
+
+/// Fetch one NAR from the upstream cache into `dest`, decompressed.
+async fn fetch_upstream_nar(app: &App, url: &str, compression: &str, dest: &Path) -> Result<u64> {
+    let nar_url = format!("{}/{url}", app.upstream_url);
+    let decompress = match compression {
+        "none" => "cat",
+        "xz" => "xz -dc",
+        "zstd" => "zstd -dcq",
+        "bzip2" => "bzip2 -dc",
+        other => bail!("unsupported upstream NAR compression {other}"),
+    };
+    // The URL comes from a parsed narinfo (no quotes, no "..", no scheme);
+    // pass it and the destination as arguments, not inside the script.
+    run(Command::new("bash")
+        .args([
+            "-c",
+            &format!("set -o pipefail; curl -fsSL --max-time 1800 \"$1\" | {decompress} > \"$2\""),
+            "fetch",
+            &nar_url,
+        ])
+        .arg(dest)
+        .stdin(Stdio::null()))
+    .await?;
+    Ok(tokio::fs::metadata(dest).await?.len())
 }
 
 /// Fetch one NAR from atticd over loopback into `dest`, decompressed.
@@ -520,6 +795,18 @@ fn load_meta(app: &App, key: &str) -> Option<PairMeta> {
     serde_json::from_slice(&raw).ok()
 }
 
+fn final_level(target_size: u64) -> u32 {
+    if target_size < LARGE_TARGET_BYTES { FINAL_LEVEL_SMALL } else { FINAL_LEVEL_LARGE }
+}
+
+/// Write `meta` for `key` atomically, through `work`.
+async fn store_meta(app: &App, work: &Path, key: &str, meta: &PairMeta) -> Result<()> {
+    let tmp_meta = work.join(format!("meta-{key}.json"));
+    tokio::fs::write(&tmp_meta, serde_json::to_vec_pretty(meta)?).await?;
+    tokio::fs::rename(&tmp_meta, meta_path(app, key)).await?;
+    Ok(())
+}
+
 async fn compute(app: &App, job: &Job) -> Result<PairMeta> {
     let (t_hash, t_name) = split_store_path(&job.target)
         .ok_or_else(|| anyhow!("bad target {}", job.target))?;
@@ -528,9 +815,15 @@ async fn compute(app: &App, job: &Job) -> Result<PairMeta> {
         bail!("low disk, skipping {t_name}");
     }
 
-    let work = app.tmp_dir.join(&t_hash);
+    // A refine job and a new pair for the same target can run at once.
+    let seq = app.fetch_seq.fetch_add(1, Ordering::Relaxed);
+    let work = app.tmp_dir.join(format!("{t_hash}-{seq}"));
     tokio::fs::create_dir_all(&work).await?;
-    let result = compute_inner(app, job, &t_hash, &work).await;
+    let result = if job.source == "refine" {
+        refine_inner(app, job, &t_hash, &work).await
+    } else {
+        compute_inner(app, job, &t_hash, &work).await
+    };
     let _ = tokio::fs::remove_dir_all(&work).await;
     result
 }
@@ -538,22 +831,34 @@ async fn compute(app: &App, job: &Job) -> Result<PairMeta> {
 async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Result<PairMeta> {
     let started = Instant::now();
 
-    let target_obj = attic_object(app, t_hash)?
-        .ok_or_else(|| anyhow!("target {} not in attic", job.target))?;
+    let target_obj = find_object(app, t_hash)
+        .await?
+        .ok_or_else(|| anyhow!("target {} not in attic or upstream", job.target))?;
 
-    // Rank candidates by chunk overlap — DB only, no bytes fetched.
+    // Rank candidates by chunk overlap — DB only, no bytes fetched. An
+    // upstream path has no chunk list, so any upstream side ranks by size.
     let rank_started = Instant::now();
-    let target_chunks = chunk_set(app, target_obj.nar_id)?;
-    let mut ranked: Vec<(f64, String, AtticObject)> = Vec::new();
+    let target_chunks = match &target_obj.origin {
+        Origin::Attic { nar_id, .. } => Some(chunk_set(app, *nar_id)?),
+        Origin::Upstream { .. } => None,
+    };
+    let mut ranked: Vec<(Option<f64>, String, StoreObject)> = Vec::new();
     for base in &job.bases {
         let Some((b_hash, _)) = split_store_path(base) else { continue };
-        let Some(obj) = attic_object(app, &b_hash)? else { continue };
-        let overlap = jaccard(&target_chunks, &chunk_set(app, obj.nar_id)?);
+        let Some(obj) = find_object(app, &b_hash).await? else { continue };
+        let overlap = match (&target_chunks, &obj.origin) {
+            (Some(tc), Origin::Attic { nar_id, .. }) => Some(jaccard(tc, &chunk_set(app, *nar_id)?)),
+            _ => None,
+        };
         ranked.push((overlap, b_hash, obj));
     }
     let rank_ms = rank_started.elapsed().as_millis() as u64;
     let candidates_ranked = ranked.len();
-    let overlap_meaningful = target_chunks.len() >= MIN_CHUNKS_FOR_OVERLAP;
+    let overlap_meaningful = target_chunks
+        .as_ref()
+        .map(|c| c.len() >= MIN_CHUNKS_FOR_OVERLAP)
+        .unwrap_or(false)
+        && ranked.iter().all(|(o, _, _)| o.is_some());
     if overlap_meaningful {
         ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     } else {
@@ -565,10 +870,8 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
     // Overlap floor: a hopeless pair is decided here, from the DB alone.
     // Mark every requested pair rejected so /delta answers 204 (full
     // download) instead of looping 202, and fetch nothing.
-    if overlap_meaningful
-        && ranked.first().map(|(o, _, _)| *o < MIN_CHUNK_OVERLAP).unwrap_or(false)
-    {
-        let best_overlap = ranked.first().map(|(o, _, _)| *o).unwrap_or(0.0);
+    let best_overlap = ranked.first().and_then(|(o, _, _)| *o).unwrap_or(0.0);
+    if overlap_meaningful && best_overlap < MIN_CHUNK_OVERLAP {
         for (overlap, b_hash, base_obj) in &ranked {
             let key = pair_key(b_hash, t_hash);
             let meta = PairMeta {
@@ -582,7 +885,8 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
                 nar_sha256: String::new(),
                 references: Vec::new(),
                 deriver: None,
-                chunk_overlap: *overlap,
+                chunk_overlap: overlap.unwrap_or(-1.0),
+                refined: false,
                 compute_ms: started.elapsed().as_millis() as u64,
                 rank_ms,
                 candidates_ranked,
@@ -590,9 +894,7 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
                 created_unix: now_unix(),
                 rejected: true,
             };
-            let tmp_meta = work.join(format!("meta-{key}.json"));
-            tokio::fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?).await?;
-            tokio::fs::rename(&tmp_meta, meta_path(app, &key)).await?;
+            store_meta(app, work, &key, &meta).await?;
         }
         bail!("best chunk overlap {best_overlap:.3} below floor {MIN_CHUNK_OVERLAP} — full download, nothing fetched");
     }
@@ -600,7 +902,7 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
     let (overlap, b_hash, base_obj) = ranked
         .into_iter()
         .next()
-        .ok_or_else(|| anyhow!("no candidate base present in attic"))?;
+        .ok_or_else(|| anyhow!("no candidate base present in attic or upstream"))?;
 
     let wlog = window_log_for(base_obj.nar_size, target_obj.nar_size);
     if (1u64 << wlog) < base_obj.nar_size.max(target_obj.nar_size) {
@@ -610,13 +912,13 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
         );
     }
 
-    // NARs come from the local LRU cache, falling back to atticd/S3.
-    let (base_nar, _) = get_nar(app, &base_obj.cache, &b_hash).await?;
-    let (target_nar, target_size) = get_nar(app, &target_obj.cache, t_hash).await?;
+    // NARs come from the local LRU cache, falling back to atticd/S3 or the
+    // upstream cache.
+    let (base_nar, _) = get_nar(app, &base_obj).await?;
+    let (target_nar, target_size) = get_nar(app, &target_obj).await?;
 
-    let level = if target_size < LARGE_TARGET_BYTES { FINAL_LEVEL_SMALL } else { FINAL_LEVEL_LARGE };
     let patch_tmp = work.join("patch.zst");
-    let patch_size = zstd_patch(level, wlog, &base_nar, &target_nar, &patch_tmp).await?;
+    let patch_size = zstd_patch(FAST_LEVEL, wlog, &base_nar, &target_nar, &patch_tmp).await?;
     let nar_sha256 = sha256_file(&target_nar).await?;
 
     let key = pair_key(&b_hash, t_hash);
@@ -628,11 +930,11 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
     }
 
     let meta = PairMeta {
-        base: base_obj.store_path,
+        base: base_obj.store_path.clone(),
         target: job.target.clone(),
         algo: ALGO.into(),
         window_log: wlog,
-        level,
+        level: FAST_LEVEL,
         patch_size,
         nar_size: target_size,
         nar_sha256,
@@ -642,7 +944,8 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
             .map(|r| format!("/nix/store/{r}"))
             .collect(),
         deriver: target_obj.deriver.clone(),
-        chunk_overlap: overlap,
+        chunk_overlap: overlap.unwrap_or(-1.0),
+        refined: false,
         compute_ms: started.elapsed().as_millis() as u64,
         rank_ms,
         candidates_ranked,
@@ -650,9 +953,45 @@ async fn compute_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Resul
         created_unix: now_unix(),
         rejected,
     };
-    let tmp_meta = work.join("meta.json");
-    tokio::fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?).await?;
-    tokio::fs::rename(&tmp_meta, meta_path(app, &key)).await?;
+    store_meta(app, work, &key, &meta).await?;
+    if !rejected && final_level(target_size) > FAST_LEVEL {
+        enqueue_refine(app, &job.target, &base_obj.store_path);
+    }
+    Ok(meta)
+}
+
+/// Patch a kept pair again at the final level. The smaller blob wins; the
+/// rename is atomic, so a device that downloads the blob meanwhile gets one
+/// whole patch or the other, and both rebuild the same NAR.
+async fn refine_inner(app: &App, job: &Job, t_hash: &str, work: &Path) -> Result<PairMeta> {
+    let started = Instant::now();
+    let base = job.bases.first().ok_or_else(|| anyhow!("refine job without a base"))?;
+    let (b_hash, _) = split_store_path(base).ok_or_else(|| anyhow!("bad base {base}"))?;
+    let key = pair_key(&b_hash, t_hash);
+    let mut meta = load_meta(app, &key).ok_or_else(|| anyhow!("no pair {key} to refine"))?;
+    let level = final_level(meta.nar_size);
+    if meta.rejected || meta.refined || meta.level >= level {
+        return Ok(meta);
+    }
+    let base_obj = find_object(app, &b_hash)
+        .await?
+        .ok_or_else(|| anyhow!("base {base} not in attic or upstream"))?;
+    let target_obj = find_object(app, t_hash)
+        .await?
+        .ok_or_else(|| anyhow!("target {} not in attic or upstream", job.target))?;
+    let (base_nar, _) = get_nar(app, &base_obj).await?;
+    let (target_nar, _) = get_nar(app, &target_obj).await?;
+
+    let patch_tmp = work.join("patch.zst");
+    let patch_size = zstd_patch(level, meta.window_log, &base_nar, &target_nar, &patch_tmp).await?;
+    if patch_size < meta.patch_size {
+        tokio::fs::rename(&patch_tmp, blob_path(app, &key)).await?;
+        meta.patch_size = patch_size;
+        meta.level = level;
+    }
+    meta.refined = true;
+    meta.compute_ms += started.elapsed().as_millis() as u64;
+    store_meta(app, work, &key, &meta).await?;
     Ok(meta)
 }
 
@@ -662,7 +1001,10 @@ fn pop_job(app: &App) -> Option<Job> {
     if let Some(j) = app.demand.lock().unwrap().pop_front() {
         return Some(j);
     }
-    app.warm.lock().unwrap().pop_front()
+    if let Some(j) = app.warm.lock().unwrap().pop_front() {
+        return Some(j);
+    }
+    app.refine.lock().unwrap().pop_front()
 }
 
 async fn worker_loop(app: Arc<App>) {
@@ -695,14 +1037,20 @@ async fn worker_loop(app: Arc<App>) {
                 log(&format!("{} {t} FAILED: {e:#}", job.source));
             }
         }
-        if let Some((h, _)) = split_store_path(&t) {
-            app.inflight.lock().unwrap().remove(&h);
+        // A refine job does not hold the inflight mark; a new pair for the
+        // same target may hold it.
+        if job.source != "refine" {
+            if let Some((h, _)) = split_store_path(&t) {
+                app.inflight.lock().unwrap().remove(&h);
+            }
         }
     }
 }
 
 /// Queue a job unless the target is already computed against one of the given
 /// bases, already inflight, or the queue is full. Returns what happened.
+/// A demand for a target that waits in the warm queue moves that job to the
+/// demand queue.
 fn enqueue(app: &App, job: Job, demand: bool) -> &'static str {
     let Some((t_hash, _)) = split_store_path(&job.target) else {
         return "invalid";
@@ -714,7 +1062,10 @@ fn enqueue(app: &App, job: Job, demand: bool) -> &'static str {
             }
         }
     }
-    if !app.inflight.lock().unwrap().insert(t_hash) {
+    if !app.inflight.lock().unwrap().insert(t_hash.clone()) {
+        if demand {
+            promote(app, &t_hash);
+        }
         return "inflight";
     }
     let (q, cap) = if demand {
@@ -724,13 +1075,59 @@ fn enqueue(app: &App, job: Job, demand: bool) -> &'static str {
     };
     let mut q = q.lock().unwrap();
     if q.len() >= cap {
-        if let Some((h, _)) = split_store_path(&job.target) {
-            app.inflight.lock().unwrap().remove(&h);
-        }
+        app.inflight.lock().unwrap().remove(&t_hash);
         return "full";
     }
     q.push_back(job);
     "queued"
+}
+
+/// Move the warm job for `t_hash`, if one waits, to the demand queue.
+fn promote(app: &App, t_hash: &str) {
+    let job = {
+        let mut warm = app.warm.lock().unwrap();
+        let pos = warm.iter().position(|j| {
+            split_store_path(&j.target).map(|(h, _)| h == t_hash).unwrap_or(false)
+        });
+        match pos {
+            Some(pos) => warm.remove(pos),
+            None => None,
+        }
+    };
+    let Some(job) = job else { return };
+    let mut demand = app.demand.lock().unwrap();
+    if demand.len() < DEMAND_QUEUE_CAP {
+        demand.push_back(job);
+    } else {
+        drop(demand);
+        app.warm.lock().unwrap().push_front(job);
+    }
+}
+
+fn enqueue_refine(app: &App, target: &str, base: &str) {
+    let mut q = app.refine.lock().unwrap();
+    if q.len() >= REFINE_QUEUE_CAP
+        || q.iter().any(|j| j.target == target && j.bases.first().map(|b| b.as_str()) == Some(base))
+    {
+        return;
+    }
+    q.push_back(Job { target: target.to_string(), bases: vec![base.to_string()], source: "refine" });
+}
+
+/// After a restart: queue a refine job for every kept pair that has only
+/// the fast patch.
+fn requeue_refines(app: &App) -> usize {
+    let Ok(rd) = std::fs::read_dir(&app.meta_dir) else { return 0 };
+    let mut n = 0;
+    for entry in rd.flatten() {
+        let Ok(raw) = std::fs::read(entry.path()) else { continue };
+        let Ok(m) = serde_json::from_slice::<PairMeta>(&raw) else { continue };
+        if !m.rejected && !m.refined && m.level < final_level(m.nar_size) {
+            enqueue_refine(app, &m.target, &m.base);
+            n += 1;
+        }
+    }
+    n
 }
 
 // ---------------------------------------------------------------- rate limit
@@ -838,6 +1235,10 @@ async fn rate_limit_mw(
 #[derive(Deserialize)]
 struct UpdateStartReq {
     target_toplevel: String,
+    // The toplevel the device runs now. Optional; it starts a warm run for
+    // exactly this step before the device asks for single paths.
+    #[serde(default)]
+    base_toplevel: Option<String>,
 }
 
 /// Open an update session. The budget is derived from the target closure's
@@ -851,29 +1252,34 @@ async fn post_update_start(
     let Some((sph, _)) = split_store_path(&req.target_toplevel) else {
         return (StatusCode::BAD_REQUEST, "not a store path").into_response();
     };
-    let closure = match attic_closure(&app, &sph) {
-        Ok(c) if !c.is_empty() => c,
-        Ok(_) => return (StatusCode::NOT_FOUND, "toplevel not in cache").into_response(),
-        Err(e) => {
-            log(&format!("update-start failed: {e:#}"));
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // A toplevel's closure never changes, so it is walked once.
+    let cached = app.closures.lock().unwrap().get(&sph).cloned();
+    let hashes = match cached {
+        Some(h) => h,
+        None => {
+            let closure = match closure(&app, &sph).await {
+                Ok(c) if !c.is_empty() => c,
+                Ok(_) => return (StatusCode::NOT_FOUND, "toplevel not in cache").into_response(),
+                Err(e) => {
+                    log(&format!("update-start failed: {e:#}"));
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let hashes: Arc<HashSet<String>> = Arc::new(
+                closure.iter().filter_map(|p| split_store_path(p)).map(|(h, _)| h).collect(),
+            );
+            let mut closures = app.closures.lock().unwrap();
+            if closures.len() >= MAX_CLOSURES {
+                closures.clear();
+            }
+            closures.insert(sph.clone(), hashes.clone());
+            hashes
         }
     };
-    let budget = 2 * closure.len() as i64 + SESSION_SLACK;
-    let hashes = {
-        let mut closures = app.closures.lock().unwrap();
-        if closures.len() >= MAX_CLOSURES && !closures.contains_key(&sph) {
-            closures.clear();
-        }
-        closures
-            .entry(sph.clone())
-            .or_insert_with(|| {
-                Arc::new(
-                    closure.iter().filter_map(|p| split_store_path(p)).map(|(h, _)| h).collect(),
-                )
-            })
-            .clone()
-    };
+    let budget = 2 * hashes.len() as i64 + SESSION_SLACK;
+    if let Some(base) = req.base_toplevel.as_deref() {
+        start_priority_warm(&app, base, &req.target_toplevel);
+    }
     let token = new_session(&app, budget, hashes);
     Json(serde_json::json!({
         "session": token,
@@ -984,21 +1390,53 @@ async fn post_warm(State(app): State<Arc<App>>, Json(req): Json<WarmReq>) -> Res
     {
         return (StatusCode::BAD_REQUEST, "toplevels must be store paths").into_response();
     }
+    let id = spawn_warm(&app, req.base_toplevel, req.target_toplevel, false);
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "warm_id": id }))).into_response()
+}
+
+/// A device named the toplevel it runs. Warm that step in the demand lane,
+/// once per PRIORITY_WARM_TTL.
+fn start_priority_warm(app: &Arc<App>, base_top: &str, target_top: &str) {
+    if split_store_path(base_top).is_none() || base_top == target_top {
+        return;
+    }
+    let key = (base_top.to_string(), target_top.to_string());
+    {
+        let mut seen = app.priority_warms.lock().unwrap();
+        let now = Instant::now();
+        seen.retain(|_, at| now.duration_since(*at) < PRIORITY_WARM_TTL);
+        if seen.contains_key(&key) || seen.len() >= MAX_CLOSURES {
+            return;
+        }
+        seen.insert(key.clone(), now);
+    }
+    spawn_warm(app, key.0, key.1, true);
+}
+
+fn spawn_warm(app: &Arc<App>, base_top: String, target_top: String, priority: bool) -> u64 {
     let id = app.warm_seq.fetch_add(1, Ordering::Relaxed) + 1;
-    app.warm_runs.lock().unwrap().push(WarmRun {
-        id,
-        base_toplevel: req.base_toplevel.clone(),
-        target_toplevel: req.target_toplevel.clone(),
-        state: "pairing".into(),
-        paired: 0,
-        skipped_existing: 0,
-        unpaired: 0,
-        error: None,
-        started_unix: now_unix(),
-    });
+    {
+        let mut runs = app.warm_runs.lock().unwrap();
+        // Keep /status small: device-started runs make this grow.
+        if runs.len() >= 100 {
+            runs.remove(0);
+        }
+        runs.push(WarmRun {
+            id,
+            base_toplevel: base_top.clone(),
+            target_toplevel: target_top.clone(),
+            state: "pairing".into(),
+            priority,
+            paired: 0,
+            skipped_existing: 0,
+            unpaired: 0,
+            error: None,
+            started_unix: now_unix(),
+        });
+    }
     let app2 = app.clone();
     tokio::spawn(async move {
-        let res = warm_run(&app2, id, &req.base_toplevel, &req.target_toplevel).await;
+        let res = warm_run(&app2, id, &base_top, &target_top, priority).await;
         let mut runs = app2.warm_runs.lock().unwrap();
         if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
             if let Err(e) = res {
@@ -1007,16 +1445,21 @@ async fn post_warm(State(app): State<Arc<App>>, Json(req): Json<WarmReq>) -> Res
             }
         }
     });
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "warm_id": id }))).into_response()
+    id
 }
 
-async fn warm_run(app: &Arc<App>, id: u64, base_top: &str, target_top: &str) -> Result<()> {
+async fn warm_run(
+    app: &Arc<App>,
+    id: u64,
+    base_top: &str,
+    target_top: &str,
+    priority: bool,
+) -> Result<()> {
     let (base_sph, _) = split_store_path(base_top).unwrap();
     let (target_sph, _) = split_store_path(target_top).unwrap();
 
-    // Closure walks are pure DB reads — cheap enough to run inline.
-    let base_closure = attic_closure(app, &base_sph)?;
-    let target_closure = attic_closure(app, &target_sph)?;
+    let base_closure = closure(app, &base_sph).await?;
+    let target_closure = closure(app, &target_sph).await?;
     if target_closure.is_empty() {
         bail!("target toplevel not in attic");
     }
@@ -1040,7 +1483,11 @@ async fn warm_run(app: &Arc<App>, id: u64, base_top: &str, target_top: &str) -> 
             continue;
         };
         let job = Job { target: target.clone(), bases: cands.clone(), source: "warm" };
-        match enqueue(app, job, false) {
+        // A device-started run uses the demand lane up to half its cap, so
+        // the device's own /delta calls still find room.
+        let demand_lane =
+            priority && app.demand.lock().unwrap().len() < DEMAND_QUEUE_CAP / 2;
+        match enqueue(app, job, demand_lane) {
             "queued" => paired += 1,
             "exists" | "inflight" => skipped += 1,
             _ => unpaired += 1,
@@ -1097,6 +1544,8 @@ async fn get_status(State(app): State<Arc<App>>) -> Response {
         "nar_cache": { "files": nc_files, "bytes": nc_bytes, "max_bytes": app.nar_cache_max },
         "demand_queue": app.demand.lock().unwrap().len(),
         "warm_queue": app.warm.lock().unwrap().len(),
+        "refine_queue": app.refine.lock().unwrap().len(),
+        "upstream_known": app.upstream_mem.lock().unwrap().len(),
         "inflight": app.inflight.lock().unwrap().len(),
         "jobs_done": app.jobs_done.load(Ordering::Relaxed),
         "jobs_failed": app.jobs_failed.load(Ordering::Relaxed),
@@ -1161,6 +1610,10 @@ async fn main() -> Result<()> {
         .split_whitespace()
         .map(String::from)
         .collect();
+    let upstream_url = std::env::var("DIFFER_UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://cache.nixos.org".into())
+        .trim_end_matches('/')
+        .to_string();
     let nar_cache_max: u64 = std::env::var("DIFFER_NAR_CACHE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1175,10 +1628,16 @@ async fn main() -> Result<()> {
         attic_url,
         attic_db,
         caches,
+        upstream_url,
+        upstream_dir: state_dir.join("upstream-narinfo"),
+        upstream_mem: Mutex::new(HashMap::new()),
+        fetch_seq: AtomicU64::new(0),
         db: Mutex::new(None),
         demand: Mutex::new(VecDeque::new()),
         warm: Mutex::new(VecDeque::new()),
+        refine: Mutex::new(VecDeque::new()),
         inflight: Mutex::new(HashSet::new()),
+        priority_warms: Mutex::new(HashMap::new()),
         warm_runs: Mutex::new(Vec::new()),
         jobs_done: AtomicU64::new(0),
         jobs_failed: AtomicU64::new(0),
@@ -1188,7 +1647,7 @@ async fn main() -> Result<()> {
         closures: Mutex::new(HashMap::new()),
         rate_limited: AtomicU64::new(0),
     });
-    for d in [&app.blob_dir, &app.meta_dir, &app.tmp_dir, &app.nar_cache_dir] {
+    for d in [&app.blob_dir, &app.meta_dir, &app.tmp_dir, &app.nar_cache_dir, &app.upstream_dir] {
         std::fs::create_dir_all(d)?;
     }
     // Stale workdirs from a previous crash.
@@ -1198,13 +1657,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    let refines = requeue_refines(&app);
     for _ in 0..workers {
         tokio::spawn(worker_loop(app.clone()));
     }
     log(&format!(
-        "v0.2 listening on {listen}, {workers} workers, state {}, attic {}",
+        "v0.4 listening on {listen}, {workers} workers, state {}, attic {}, upstream {}, {refines} refines queued",
         state_dir.display(),
-        app.attic_db.display()
+        app.attic_db.display(),
+        if app.upstream_url.is_empty() { "off" } else { &app.upstream_url },
     ));
 
     let router = Router::new()
@@ -1248,6 +1709,50 @@ mod tests {
         ] {
             assert!(split_store_path(&bad).is_none(), "{bad}");
         }
+    }
+
+    fn narinfo(store_hash: &str, url: &str) -> String {
+        format!(
+            "StorePath: /nix/store/{store_hash}-glibc-2.42-84\n\
+             URL: {url}\n\
+             Compression: xz\n\
+             FileHash: sha256:0000\n\
+             FileSize: 100\n\
+             NarHash: sha256:1111\n\
+             NarSize: 31457280\n\
+             References: {store_hash}-glibc-2.42-84 abcd0000abcd0000abcd0000abcd0000-libidn2-2.3.8\n\
+             Deriver: 5b0v0000abcd0000abcd0000abcd0000-glibc-2.42-84.drv\n\
+             Sig: cache.nixos.org-1:xyz\n"
+        )
+    }
+
+    #[test]
+    fn parse_narinfo_reads_upstream_fields() {
+        let obj = parse_narinfo(&narinfo(H, "nar/0abc.nar.xz"), H).unwrap();
+        assert_eq!(obj.store_path, format!("/nix/store/{H}-glibc-2.42-84"));
+        assert_eq!(obj.nar_size, 31457280);
+        assert_eq!(obj.references.len(), 2);
+        assert_eq!(obj.deriver.as_deref(), Some("5b0v0000abcd0000abcd0000abcd0000-glibc-2.42-84.drv"));
+        assert_eq!(
+            obj.origin,
+            Origin::Upstream { url: "nar/0abc.nar.xz".into(), compression: "xz".into() }
+        );
+    }
+
+    #[test]
+    fn parse_narinfo_rejects_other_path_or_bad_url() {
+        let other = "abcd0000abcd0000abcd0000abcd0000";
+        assert!(parse_narinfo(&narinfo(H, "nar/0abc.nar.xz"), other).is_none());
+        for url in ["../x.nar", "/nar/x.nar", "https://evil/x.nar", ""] {
+            assert!(parse_narinfo(&narinfo(H, url), H).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn final_level_splits_on_target_size() {
+        assert_eq!(final_level(1024), FINAL_LEVEL_SMALL);
+        assert_eq!(final_level(LARGE_TARGET_BYTES), FINAL_LEVEL_LARGE);
+        assert!(FAST_LEVEL < FINAL_LEVEL_LARGE);
     }
 
     #[test]

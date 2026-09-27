@@ -128,11 +128,16 @@ in
     wants = [ "network-online.target" ];
     environment = {
       WARM_DIFFER_URL = "http://127.0.0.1:8090";
+      # <owner>/<repo>/<branch>/<path>, read with git ls-remote and
+      # raw.githubusercontent.com by commit (differ-warm.py).
       WARM_MANIFESTS = lib.concatStringsSep " " [
-        "https://api.github.com/repos/brickbots/PiFinder/contents/update-manifest.json?ref=nixos-manifest"
-        "https://api.github.com/repos/mrosseel/PiFinder/contents/update-manifest.json?ref=nixos-manifest"
+        "brickbots/PiFinder/nixos-manifest/update-manifest.json"
+        "mrosseel/PiFinder/nixos-manifest/update-manifest.json"
       ];
+      # git looks for its config in HOME.
+      HOME = "/var/lib/pifinder-differ-warm";
     };
+    path = [ pkgs.git ];
     serviceConfig = {
       Type = "oneshot";
       ExecStart = "${pkgs.python3}/bin/python3 ${./differ-warm.py}";

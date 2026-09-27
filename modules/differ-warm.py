@@ -6,19 +6,22 @@ it in its channel, it asks the differ (POST /warm on loopback) to compute the
 patches from the old build to the new one. Devices that upgrade along that
 step then get their patches at once instead of a 202 "computing".
 
-The manifests are read through the GitHub contents API, not
-raw.githubusercontent.com, whose CDN serves a branch file up to 5 minutes
-stale. Each request sends the last ETag; a 304 answer does not count against
-the unauthenticated limit of 60 requests per hour, so a 1-minute timer fits.
+Each manifest is "<owner>/<repo>/<branch>/<path>". `git ls-remote` gives the
+commit of the branch; only when it moved is the file fetched again, from
+raw.githubusercontent.com by that commit. Neither is under the GitHub API
+limit (60 requests per hour without a login, which a 1-minute timer with two
+manifests passes), and a URL with the commit in it is never stale, unlike
+the CDN copy of a branch file.
 
 State (which store path each label had, which pairs were warmed, and the last
-ETag and body per manifest) lives in $STATE_DIRECTORY/seen.json. Standard
-library only.
+commit and body per manifest) lives in $STATE_DIRECTORY/seen.json. Standard
+library and git only.
 """
 
 import json
 import os
 import re
+import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -38,21 +41,26 @@ CROSS_DAYS = int(os.environ.get("WARM_CROSS_DAYS", "7"))
 CROSS_MAX = int(os.environ.get("WARM_CROSS_MAX", "8"))
 
 
-def fetch_json(url: str, cached: dict):
-    """The manifest at `url`. `cached` holds the last ETag and body for it and
-    is updated; a 304 answer reuses the cached body."""
-    headers = {"accept": "application/vnd.github.raw+json"}
-    if cached.get("etag"):
-        headers["if-none-match"] = cached["etag"]
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode()
-            cached["etag"] = resp.headers.get("etag", "")
-            cached["body"] = body
-    except urllib.error.HTTPError as exc:
-        if exc.code != 304 or "body" not in cached:
-            raise
+def fetch_json(spec: str, cached: dict):
+    """The manifest named by `spec`, "<owner>/<repo>/<branch>/<path>".
+    `cached` holds the branch commit and the body of the last fetch and is
+    updated; the body is fetched again only when the branch moved."""
+    owner, repo, branch, path = spec.split("/", 3)
+    out = subprocess.run(
+        ["git", "ls-remote", f"https://github.com/{owner}/{repo}", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    ).stdout.split()
+    if not out:
+        raise ValueError(f"no branch {branch} in {owner}/{repo}")
+    commit = out[0]
+    if commit != cached.get("commit") or "body" not in cached:
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{commit}/{path}"
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            cached["body"] = resp.read().decode()
+        cached["commit"] = commit
     return json.loads(cached["body"])
 
 
@@ -128,7 +136,7 @@ def main() -> None:
     for url in MANIFESTS:
         try:
             manifest = fetch_json(url, manifests.setdefault(url, {}))
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, subprocess.SubprocessError) as exc:
             print(f"manifest {url}: {exc}")
             continue
         for channel, entries in (manifest.get("channels") or {}).items():

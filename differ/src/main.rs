@@ -22,9 +22,13 @@
 //   POST /update-start — open a session; an optional base_toplevel starts
 //                  a warm run for exactly that step, in the demand lane
 //   POST /delta  — a device names a target and the bases it holds (demand)
+//   POST /deltas — the same for many targets in one request; the answer is a
+//                  stream of JSON lines, one per target as soon as its patch
+//                  is ready, with a heartbeat line while it waits
 //   POST /warm   — enqueue every stem-paired path between two toplevels
 //   GET  /pairs  — every computed pair with sizes/ratios
 //   GET  /status — queues, counters, warm-run progress
+//   GET  /metrics — the same counters for Prometheus (loopback only)
 //   GET  /blobs/<base>_<target>.zst
 //
 // Demand jobs always run before warm jobs, and warm jobs before refine jobs. All compute runs at the unit's
@@ -88,6 +92,11 @@ const UPSTREAM_PARALLEL: usize = 32;
 const UPSTREAM_BATCH: usize = 256;
 const UPSTREAM_NEGATIVE_TTL: Duration = Duration::from_secs(3600);
 const UPSTREAM_MEM_MAX: usize = 100_000;
+// POST /deltas: targets per request, how long the stream stays open, and how
+// often it sends a heartbeat line while targets are pending.
+const MAX_STREAM_TARGETS: usize = 4000;
+const STREAM_MAX: Duration = Duration::from_secs(90);
+const STREAM_HEARTBEAT: Duration = Duration::from_secs(10);
 // A device's base_toplevel starts one warm run per step, not one per session.
 const PRIORITY_WARM_TTL: Duration = Duration::from_secs(3600);
 
@@ -139,6 +148,10 @@ struct App {
     warm_runs: Mutex<Vec<WarmRun>>,
     jobs_done: AtomicU64,
     jobs_failed: AtomicU64,
+    // Woken each time a worker ends a job, for the /deltas streams.
+    job_done: tokio::sync::Notify,
+    // Prometheus counters: the series ("name{labels}") and its value.
+    metrics: Mutex<HashMap<String, f64>>,
     warm_seq: AtomicU64,
     rate: Mutex<HashMap<String, TokenBucket>>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -233,6 +246,11 @@ struct StoreObject {
 
 fn log(msg: &str) {
     eprintln!("[pifinder-differ] {msg}");
+}
+
+/// Add `by` to the Prometheus counter `series` ("name{label=\"v\"}").
+fn count(app: &App, series: &str, by: f64) {
+    *app.metrics.lock().unwrap().entry(series.to_string()).or_insert(0.0) += by;
 }
 
 fn now_unix() -> u64 {
@@ -1014,7 +1032,30 @@ async fn worker_loop(app: Arc<App>) {
             continue;
         };
         let t = job.target.clone();
-        match compute(&app, &job).await {
+        let started = Instant::now();
+        let result = compute(&app, &job).await;
+        let lane = job.source;
+        count(
+            &app,
+            &format!("pifinder_differ_job_seconds_total{{lane=\"{lane}\"}}"),
+            started.elapsed().as_secs_f64(),
+        );
+        match &result {
+            Ok(m) if m.rejected => {
+                count(&app, &format!("pifinder_differ_jobs_total{{lane=\"{lane}\",result=\"rejected\"}}"), 1.0);
+            }
+            Ok(m) => {
+                count(&app, &format!("pifinder_differ_jobs_total{{lane=\"{lane}\",result=\"ok\"}}"), 1.0);
+                if lane != "refine" {
+                    count(&app, "pifinder_differ_patch_bytes_total", m.patch_size as f64);
+                    count(&app, "pifinder_differ_nar_bytes_total", m.nar_size as f64);
+                }
+            }
+            Err(_) => {
+                count(&app, &format!("pifinder_differ_jobs_total{{lane=\"{lane}\",result=\"failed\"}}"), 1.0);
+            }
+        }
+        match result {
             Ok(m) => {
                 app.jobs_done.fetch_add(1, Ordering::Relaxed);
                 log(&format!(
@@ -1044,6 +1085,7 @@ async fn worker_loop(app: Arc<App>) {
                 app.inflight.lock().unwrap().remove(&h);
             }
         }
+        app.job_done.notify_waiters();
     }
 }
 
@@ -1222,6 +1264,7 @@ async fn rate_limit_mw(
     };
     if !allowed {
         app.rate_limited.fetch_add(1, Ordering::Relaxed);
+        count(&app, "pifinder_differ_rate_limited_total", 1.0);
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "60")],
@@ -1280,6 +1323,7 @@ async fn post_update_start(
     if let Some(base) = req.base_toplevel.as_deref() {
         start_priority_warm(&app, base, &req.target_toplevel);
     }
+    count(&app, "pifinder_differ_sessions_total", 1.0);
     let token = new_session(&app, budget, hashes);
     Json(serde_json::json!({
         "session": token,
@@ -1291,7 +1335,7 @@ async fn post_update_start(
 
 // ---------------------------------------------------------------- HTTP
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct DeltaReq {
     target: String,
     bases: Vec<String>,
@@ -1308,6 +1352,42 @@ struct DeltaHit {
     nar_sha256: String,
     references: Vec<String>,
     deriver: Option<String>,
+}
+
+enum Resolved {
+    Hit(DeltaHit),
+    // Every requested pair is decided and rejected: download in full.
+    NoPatch,
+    // At least one pair is not computed yet.
+    Pending,
+}
+
+/// The answer for a target and the bases the device holds, from the pair
+/// metadata alone.
+fn resolve(app: &App, t_hash: &str, bases: &[String]) -> Resolved {
+    let mut all_rejected = true;
+    for base in bases {
+        let Some((b_hash, _)) = split_store_path(base) else { continue };
+        let key = pair_key(&b_hash, t_hash);
+        if let Some(meta) = load_meta(app, &key) {
+            if meta.rejected {
+                continue;
+            }
+            return Resolved::Hit(DeltaHit {
+                algo: meta.algo,
+                basis: vec![meta.base],
+                window_log: meta.window_log,
+                url: format!("/blobs/{key}.zst"),
+                size: meta.patch_size,
+                nar_size: meta.nar_size,
+                nar_sha256: meta.nar_sha256,
+                references: meta.references,
+                deriver: meta.deriver,
+            });
+        }
+        all_rejected = false;
+    }
+    if all_rejected { Resolved::NoPatch } else { Resolved::Pending }
 }
 
 async fn post_delta(
@@ -1344,38 +1424,173 @@ async fn post_delta(
         return (StatusCode::BAD_REQUEST, "no valid bases").into_response();
     }
 
-    let mut all_rejected = true;
-    for base in &bases {
-        let (b_hash, _) = split_store_path(base).unwrap();
-        let key = pair_key(&b_hash, &t_hash);
-        if let Some(meta) = load_meta(&app, &key) {
-            if meta.rejected {
-                continue;
-            }
-            return Json(DeltaHit {
-                algo: meta.algo,
-                basis: vec![meta.base],
-                window_log: meta.window_log,
-                url: format!("/blobs/{key}.zst"),
-                size: meta.patch_size,
-                nar_size: meta.nar_size,
-                nar_sha256: meta.nar_sha256,
-                references: meta.references,
-                deriver: meta.deriver,
-            })
-            .into_response();
+    match resolve(&app, &t_hash, &bases) {
+        Resolved::Hit(hit) => {
+            count(&app, "pifinder_differ_answers_total{endpoint=\"delta\",answer=\"hit\"}", 1.0);
+            return Json(hit).into_response();
         }
-        all_rejected = false;
-    }
-    if all_rejected {
-        return StatusCode::NO_CONTENT.into_response();
+        Resolved::NoPatch => {
+            count(&app, "pifinder_differ_answers_total{endpoint=\"delta\",answer=\"none\"}", 1.0);
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        Resolved::Pending => {}
     }
 
+    count(&app, "pifinder_differ_answers_total{endpoint=\"delta\",answer=\"wait\"}", 1.0);
     match enqueue(&app, Job { target: req.target, bases, source: "demand" }, true) {
         "full" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         // queued | inflight | exists-under-other-base: tell the device to retry
         _ => (StatusCode::ACCEPTED, [("retry-after", "15")], "computing").into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct DeltasReq {
+    targets: Vec<DeltaReq>,
+}
+
+/// POST /deltas: the /delta answer for many targets in one request. The
+/// response is a stream of JSON lines (application/x-ndjson):
+///   {"target", "state": "hit", "delta": {...as /delta 200...}}
+///   {"target", "state": "none"}   no patch: download in full
+///   {"target", "state": "wait"}   still computing when the stream ended
+///   {"state": "heartbeat", "pending": n}   every STREAM_HEARTBEAT
+///   {"state": "end"}              last line
+/// A line for a target comes as soon as its patch is decided, so the device
+/// applies the first patches while the server computes the rest. A stream
+/// that is cut before "end" leaves the device to ask again for the targets it
+/// has no line for.
+async fn post_deltas(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<DeltasReq>,
+) -> Response {
+    if req.targets.is_empty() || req.targets.len() > MAX_STREAM_TARGETS {
+        return (StatusCode::BAD_REQUEST, "1 to 4000 targets").into_response();
+    }
+    // Public requests carry a session (rate_limit_mw refuses them otherwise);
+    // a request without one is direct loopback ops traffic.
+    let closure = match headers.get("x-update-session").and_then(|v| v.to_str().ok()) {
+        Some(token) => match app.sessions.lock().unwrap().get(token) {
+            Some(s) => Some(s.closure.clone()),
+            None => return (StatusCode::FORBIDDEN, "unknown session").into_response(),
+        },
+        None => None,
+    };
+    let (writer, reader) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(stream_deltas(app, closure, req.targets, writer));
+    (
+        [("content-type", "application/x-ndjson"), ("cache-control", "no-cache")],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response()
+}
+
+async fn emit(app: &App, w: &mut tokio::io::DuplexStream, line: serde_json::Value) -> bool {
+    use tokio::io::AsyncWriteExt;
+    if line.get("target").is_some() {
+        if let Some(state) = line.get("state").and_then(|v| v.as_str()) {
+            count(app, &format!("pifinder_differ_answers_total{{endpoint=\"deltas\",answer=\"{state}\"}}"), 1.0);
+        }
+    }
+    let mut buf = line.to_string();
+    buf.push('\n');
+    w.write_all(buf.as_bytes()).await.is_ok()
+}
+
+async fn stream_deltas(
+    app: Arc<App>,
+    closure: Option<Arc<HashSet<String>>>,
+    targets: Vec<DeltaReq>,
+    mut w: tokio::io::DuplexStream,
+) {
+    use serde_json::json;
+    let started = Instant::now();
+    // (target, target hash, bases) still without an answer.
+    let mut pending: Vec<(String, String, Vec<String>)> = Vec::new();
+    for req in targets {
+        let Some((t_hash, _)) = split_store_path(&req.target) else { continue };
+        let allowed = closure.as_ref().map(|c| c.contains(&t_hash)).unwrap_or(true);
+        let bases: Vec<String> = req
+            .bases
+            .iter()
+            .filter(|b| split_store_path(b).is_some())
+            .take(MAX_BASES)
+            .cloned()
+            .collect();
+        if !allowed || bases.is_empty() {
+            if !emit(&app, &mut w, json!({"target": req.target, "state": "none"})).await {
+                return;
+            }
+            continue;
+        }
+        let line = match resolve(&app, &t_hash, &bases) {
+            Resolved::Hit(hit) => Some(json!({"target": req.target, "state": "hit", "delta": hit})),
+            Resolved::NoPatch => Some(json!({"target": req.target, "state": "none"})),
+            Resolved::Pending => {
+                let job = Job { target: req.target.clone(), bases: bases.clone(), source: "demand" };
+                if enqueue(&app, job, true) == "full" {
+                    Some(json!({"target": req.target, "state": "none"}))
+                } else {
+                    pending.push((req.target, t_hash, bases));
+                    None
+                }
+            }
+        };
+        if let Some(line) = line {
+            if !emit(&app, &mut w, line).await {
+                return;
+            }
+        }
+    }
+
+    let mut last_beat = Instant::now();
+    while !pending.is_empty() && started.elapsed() < STREAM_MAX {
+        // Register for the wake-up before the check, so that a job that ends
+        // between the check and the wait is not missed.
+        let notified = app.job_done.notified();
+        let mut still = Vec::new();
+        for (target, t_hash, bases) in pending.drain(..) {
+            let line = match resolve(&app, &t_hash, &bases) {
+                Resolved::Hit(hit) => Some(json!({"target": target, "state": "hit", "delta": hit})),
+                Resolved::NoPatch => Some(json!({"target": target, "state": "none"})),
+                // Not computed and not in the queue any more: the job failed
+                // without a result. The device downloads it in full.
+                Resolved::Pending if !app.inflight.lock().unwrap().contains(&t_hash) => {
+                    Some(json!({"target": target, "state": "none"}))
+                }
+                Resolved::Pending => None,
+            };
+            match line {
+                Some(line) => {
+                    if !emit(&app, &mut w, line).await {
+                        return;
+                    }
+                }
+                None => still.push((target, t_hash, bases)),
+            }
+        }
+        pending = still;
+        if pending.is_empty() {
+            break;
+        }
+        if last_beat.elapsed() >= STREAM_HEARTBEAT {
+            last_beat = Instant::now();
+            if !emit(&app, &mut w, json!({"state": "heartbeat", "pending": pending.len()})).await {
+                return;
+            }
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    for (target, _, _) in pending {
+        if !emit(&app, &mut w, json!({"target": target, "state": "wait"})).await {
+            return;
+        }
+    }
+    let _ = emit(&app, &mut w, json!({"state": "end"})).await;
 }
 
 #[derive(Deserialize)]
@@ -1538,6 +1753,52 @@ async fn get_pairs(State(app): State<Arc<App>>) -> Response {
     .into_response()
 }
 
+fn dir_bytes(dir: &Path) -> (usize, u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return (0, 0) };
+    rd.flatten()
+        .filter_map(|e| e.metadata().ok())
+        .fold((0, 0), |(n, b), md| (n + 1, b + md.len()))
+}
+
+/// Prometheus text format. Counters from `metrics`, gauges read now.
+async fn get_metrics(State(app): State<Arc<App>>) -> Response {
+    let (nc_files, nc_bytes) = nar_cache_stats(&app);
+    let (blob_files, blob_bytes) = dir_bytes(&app.blob_dir);
+    let mut out = String::new();
+    let mut series: Vec<(String, f64)> =
+        app.metrics.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect();
+    series.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut typed: HashSet<String> = HashSet::new();
+    for (name, value) in series {
+        let base = name.split('{').next().unwrap_or(&name).to_string();
+        if typed.insert(base.clone()) {
+            out.push_str(&format!("# TYPE {base} counter\n"));
+        }
+        out.push_str(&format!("{name} {value}\n"));
+    }
+    let gauges = [
+        ("pifinder_differ_queue_length{lane=\"demand\"}", app.demand.lock().unwrap().len() as f64),
+        ("pifinder_differ_queue_length{lane=\"warm\"}", app.warm.lock().unwrap().len() as f64),
+        ("pifinder_differ_queue_length{lane=\"refine\"}", app.refine.lock().unwrap().len() as f64),
+        ("pifinder_differ_inflight", app.inflight.lock().unwrap().len() as f64),
+        ("pifinder_differ_active_sessions", app.sessions.lock().unwrap().len() as f64),
+        ("pifinder_differ_nar_cache_bytes", nc_bytes as f64),
+        ("pifinder_differ_nar_cache_files", nc_files as f64),
+        ("pifinder_differ_blob_bytes", blob_bytes as f64),
+        ("pifinder_differ_blob_files", blob_files as f64),
+        ("pifinder_differ_upstream_known", app.upstream_mem.lock().unwrap().len() as f64),
+    ];
+    let mut typed_g: HashSet<&str> = HashSet::new();
+    for (name, value) in gauges {
+        let base = name.split('{').next().unwrap_or(name);
+        if typed_g.insert(base) {
+            out.push_str(&format!("# TYPE {base} gauge\n"));
+        }
+        out.push_str(&format!("{name} {value}\n"));
+    }
+    ([("content-type", "text/plain; version=0.0.4")], out).into_response()
+}
+
 async fn get_status(State(app): State<Arc<App>>) -> Response {
     let (nc_files, nc_bytes) = nar_cache_stats(&app);
     Json(serde_json::json!({
@@ -1641,6 +1902,8 @@ async fn main() -> Result<()> {
         warm_runs: Mutex::new(Vec::new()),
         jobs_done: AtomicU64::new(0),
         jobs_failed: AtomicU64::new(0),
+        job_done: tokio::sync::Notify::new(),
+        metrics: Mutex::new(HashMap::new()),
         warm_seq: AtomicU64::new(0),
         rate: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
@@ -1671,8 +1934,10 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/health", get(get_health))
         .route("/status", get(get_status))
+        .route("/metrics", get(get_metrics))
         .route("/pairs", get(get_pairs))
         .route("/delta", post(post_delta))
+        .route("/deltas", post(post_deltas))
         .route("/update-start", post(post_update_start))
         .route("/warm", post(post_warm))
         .route("/blobs/:name", get(get_blob))

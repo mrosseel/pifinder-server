@@ -21,16 +21,50 @@ own flake:
   (`docs/adr/0031-delta-updates-on-demand-differ.md`); device side:
   `python/PiFinder/delta_updates.py`.
 
-The HTTPS front (Caddy) is configured on the host, not here — see
-[docs/caddy.md](docs/caddy.md) for the required vhosts.
+## Deploying on a server
 
-## Consuming
+Import the module and switch the two services on. The defaults are the
+values of the pifinder.eu server; a second server sets its own domains, S3
+bucket and manifests.
 
 ```nix
+# flake.nix of the host
 inputs.pifinder-server.url = "github:mrosseel/pifinder-server";
 # in the host's module list:
 inputs.pifinder-server.nixosModules.default
 ```
+
+```nix
+services.pifinder-attic = {
+  enable = true;
+  domain = "cache.example.org";
+  storage = { type = "s3"; region = "eu-west-1"; bucket = "example-pifinder-cache"; };
+};
+services.pifinder-differ = {
+  enable = true;
+  domain = "deltas.example.org";
+  warm.manifests = [ "example/PiFinder/nixos-manifest/update-manifest.json" ];
+};
+```
+
+[examples/host.nix](examples/host.nix) is a full example with the steps
+before and after the first deploy. `nix flake check` evaluates it.
+
+What the modules do:
+
+- **Caddy:** each service writes its own vhost and enables Caddy
+  (`caddy.enable`, on by default). For another proxy, set it to false and
+  copy the config from [docs/caddy.md](docs/caddy.md).
+- **Monitoring:** `services.pifinder-differ.monitoring.prometheus` adds the
+  scrape job, and `monitoring.grafanaDashboard` provisions the dashboard.
+  Both are off by default, because they need Prometheus and Grafana on the
+  host.
+- **Secrets:** the module never holds them. The S3 keys go in
+  `/var/lib/atticd/env` before the first start. The CI token appears in
+  `/var/lib/atticd/ci-token` after it.
+
+The differ must run on the same host as Attic: it reads the Attic database
+and fetches NARs from Attic over loopback.
 
 ## Developing the differ
 

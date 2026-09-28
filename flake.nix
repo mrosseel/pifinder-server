@@ -9,10 +9,10 @@
       forSystems = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
     in
     {
-      # Consumed by the host's flake (nixos-config) as:
+      # Consumed by the host's flake as
       #   inputs.pifinder-server.nixosModules.default
-      # The host must also provide the HTTPS front (see docs/caddy.md) and,
-      # for attic, the S3 credentials in /var/lib/atticd/env.
+      # and switched on with services.pifinder-attic.enable and
+      # services.pifinder-differ.enable. examples/host.nix shows a full host.
       nixosModules = {
         pifinder-differ = import ./modules/pifinder-differ.nix;
         attic = import ./modules/attic.nix;
@@ -37,5 +37,33 @@
         };
         default = pifinder-differ;
       });
+
+      # Evaluates examples/host.nix as a complete NixOS system:
+      #   nix flake check
+      checks = forSystems (pkgs:
+        let
+          example = nixpkgs.lib.nixosSystem {
+            inherit (pkgs) system;
+            modules = [
+              self.nixosModules.default
+              ./examples/host.nix
+              {
+                services.prometheus.enable = true;
+                services.grafana.enable = true;
+                services.grafana.settings.security.secret_key = "example-only";
+                boot.loader.grub.enable = false;
+                fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+                system.stateVersion = "26.05";
+              }
+            ];
+          };
+          drv = builtins.unsafeDiscardStringContext
+            example.config.system.build.toplevel.drvPath;
+        in
+        {
+          example-host = pkgs.runCommand "example-host-eval" { } ''
+            echo ${drv} > $out
+          '';
+        });
     };
 }

@@ -20,7 +20,9 @@
 //
 // Endpoints:
 //   POST /update-start — open a session; an optional base_toplevel starts
-//                  a warm run for exactly that step, in the demand lane
+//                  a warm run for exactly that step, in the demand lane.
+//                  The reply lists the target closure with NAR sizes, so a
+//                  device finds its missing paths without a nix dry run
 //   POST /delta  — a device names a target and the bases it holds (demand)
 //   POST /deltas — the same for many targets in one request; the answer is a
 //                  stream of JSON lines, one per target as soon as its patch
@@ -155,10 +157,18 @@ struct App {
     warm_seq: AtomicU64,
     rate: Mutex<HashMap<String, TokenBucket>>,
     sessions: Mutex<HashMap<String, Session>>,
-    // Closure store-path hashes per target toplevel hash, shared by every
-    // session for that toplevel. Bounded by MAX_CLOSURES.
-    closures: Mutex<HashMap<String, Arc<HashSet<String>>>>,
+    // Closure per target toplevel hash, shared by every session for that
+    // toplevel. Bounded by MAX_CLOSURES.
+    closures: Mutex<HashMap<String, ToplevelClosure>>,
     rate_limited: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ToplevelClosure {
+    // Store-path hashes: the paths a session may ask for.
+    hashes: Arc<HashSet<String>>,
+    // (full store path, NAR size) per path, for the /update-start reply.
+    paths: Arc<Vec<(String, u64)>>,
 }
 
 struct TokenBucket {
@@ -605,16 +615,22 @@ fn jaccard(a: &HashSet<i64>, b: &HashSet<i64>) -> f64 {
     if union == 0.0 { 0.0 } else { inter / union }
 }
 
+/// Full runtime closure of a toplevel as full store paths. See
+/// closure_sized.
+async fn closure(app: &App, toplevel_sph: &str) -> Result<Vec<String>> {
+    Ok(closure_sized(app, toplevel_sph).await?.into_iter().map(|(p, _)| p).collect())
+}
+
 /// Full runtime closure of a toplevel, walked via `references`, one level
 /// at a time so the upstream lookups of a level go out in one batch. The
-/// toplevel itself must be in attic. Returns full store paths; paths that
-/// neither attic nor upstream has (GC holes) are skipped.
-async fn closure(app: &App, toplevel_sph: &str) -> Result<Vec<String>> {
+/// toplevel itself must be in attic. Returns (full store path, NAR size);
+/// paths that neither attic nor upstream has (GC holes) are skipped.
+async fn closure_sized(app: &App, toplevel_sph: &str) -> Result<Vec<(String, u64)>> {
     if attic_object(app, toplevel_sph)?.is_none() {
         return Ok(Vec::new());
     }
     let mut seen: HashSet<String> = HashSet::from([toplevel_sph.to_string()]);
-    let mut order: Vec<String> = Vec::new();
+    let mut order: Vec<(String, u64)> = Vec::new();
     let mut frontier: Vec<String> = vec![toplevel_sph.to_string()];
     let (mut missing, mut upstream) = (0usize, 0usize);
     while !frontier.is_empty() {
@@ -628,7 +644,7 @@ async fn closure(app: &App, toplevel_sph: &str) -> Result<Vec<String>> {
             if matches!(obj.origin, Origin::Upstream { .. }) {
                 upstream += 1;
             }
-            order.push(obj.store_path.clone());
+            order.push((obj.store_path.clone(), obj.nar_size));
             for r in &obj.references {
                 if let Some((rh, _)) = split_store_path(&format!("/nix/store/{r}")) {
                     if seen.insert(rh.clone()) {
@@ -1297,10 +1313,10 @@ async fn post_update_start(
     };
     // A toplevel's closure never changes, so it is walked once.
     let cached = app.closures.lock().unwrap().get(&sph).cloned();
-    let hashes = match cached {
-        Some(h) => h,
+    let closure = match cached {
+        Some(c) => c,
         None => {
-            let closure = match closure(&app, &sph).await {
+            let paths = match closure_sized(&app, &sph).await {
                 Ok(c) if !c.is_empty() => c,
                 Ok(_) => return (StatusCode::NOT_FOUND, "toplevel not in cache").into_response(),
                 Err(e) => {
@@ -1309,28 +1325,36 @@ async fn post_update_start(
                 }
             };
             let hashes: Arc<HashSet<String>> = Arc::new(
-                closure.iter().filter_map(|p| split_store_path(p)).map(|(h, _)| h).collect(),
+                paths.iter().filter_map(|(p, _)| split_store_path(p)).map(|(h, _)| h).collect(),
             );
+            let entry = ToplevelClosure { hashes, paths: Arc::new(paths) };
             let mut closures = app.closures.lock().unwrap();
             if closures.len() >= MAX_CLOSURES {
                 closures.clear();
             }
-            closures.insert(sph.clone(), hashes.clone());
-            hashes
+            closures.insert(sph.clone(), entry.clone());
+            entry
         }
     };
-    let budget = 2 * hashes.len() as i64 + SESSION_SLACK;
+    let budget = 2 * closure.hashes.len() as i64 + SESSION_SLACK;
     if let Some(base) = req.base_toplevel.as_deref() {
         start_priority_warm(&app, base, &req.target_toplevel);
     }
     count(&app, "pifinder_differ_sessions_total", 1.0);
-    let token = new_session(&app, budget, hashes);
-    Json(serde_json::json!({
+    let token = new_session(&app, budget, closure.hashes.clone());
+    Json(update_start_body(&token, budget, &closure.paths)).into_response()
+}
+
+/// The /update-start reply. "closure" lists the target closure as
+/// [store path, NAR size] pairs; a client that does not know the field
+/// ignores it.
+fn update_start_body(token: &str, budget: i64, closure: &[(String, u64)]) -> serde_json::Value {
+    serde_json::json!({
         "session": token,
         "budget": budget,
         "expires_in": SESSION_TTL.as_secs(),
-    }))
-    .into_response()
+        "closure": closure,
+    })
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -2011,6 +2035,22 @@ mod tests {
         for url in ["../x.nar", "/nar/x.nar", "https://evil/x.nar", ""] {
             assert!(parse_narinfo(&narinfo(H, url), H).is_none(), "{url}");
         }
+    }
+
+    #[test]
+    fn update_start_body_lists_the_closure_with_nar_sizes() {
+        let closure = vec![
+            (format!("/nix/store/{H}-glibc-2.42-84"), 31457280u64),
+            (format!("/nix/store/{H}-nixos-system-pifinder"), 1024u64),
+        ];
+        let body = update_start_body("tok", 42, &closure);
+        assert_eq!(body["session"], "tok");
+        assert_eq!(body["budget"], 42);
+        assert_eq!(body["expires_in"], SESSION_TTL.as_secs());
+        let listed = body["closure"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0][0], format!("/nix/store/{H}-glibc-2.42-84"));
+        assert_eq!(listed[0][1], 31457280u64);
     }
 
     #[test]

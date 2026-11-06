@@ -1,9 +1,16 @@
 {
   description = "PiFinder server-side infrastructure: Attic binary cache + delta update server";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Only the AWS host uses it, for the nixos-anywhere disk layout.
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, disko }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
@@ -22,6 +29,19 @@
             ./modules/attic.nix
           ];
         };
+        # Both services with the PiFinder project's own values
+        # (cache.pifinder.io, deltas.pifinder.io). Every server for those
+        # names imports it.
+        pifinder-site = import ./modules/site.nix;
+      };
+
+      # The AWS server. hosts/aws/README.md has the install with nixos-anywhere.
+      nixosConfigurations.pifinder-aws = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux";
+        modules = [
+          disko.nixosModules.disko
+          ./hosts/aws/configuration.nix
+        ];
       };
 
       # Standalone build for development: nix build .#pifinder-differ
@@ -38,7 +58,8 @@
         default = pifinder-differ;
       });
 
-      # Evaluates examples/host.nix as a complete NixOS system:
+      # Evaluates examples/host.nix and the AWS host as complete NixOS
+      # systems:
       #   nix flake check
       checks = forSystems (pkgs:
         let
@@ -59,10 +80,15 @@
           };
           drv = builtins.unsafeDiscardStringContext
             example.config.system.build.toplevel.drvPath;
+          awsDrv = builtins.unsafeDiscardStringContext
+            self.nixosConfigurations.pifinder-aws.config.system.build.toplevel.drvPath;
         in
         {
           example-host = pkgs.runCommand "example-host-eval" { } ''
             echo ${drv} > $out
+          '';
+          aws-host = pkgs.runCommand "aws-host-eval" { } ''
+            echo ${awsDrv} > $out
           '';
         });
     };

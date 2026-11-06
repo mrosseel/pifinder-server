@@ -50,6 +50,13 @@ services.pifinder-differ = {
 [examples/host.nix](examples/host.nix) is a full example with the steps
 before and after the first deploy. `nix flake check` evaluates it.
 
+A server for the PiFinder project itself imports
+`inputs.pifinder-server.nixosModules.pifinder-site` instead. It switches on
+both services for `cache.pifinder.io` and `deltas.pifinder.io`, with the
+`.eu` names as aliases. [hosts/aws](hosts/aws/README.md) is the AWS host that
+uses it, with the nixos-anywhere install and the move from the current
+server.
+
 What the modules do:
 
 - **Caddy:** each service writes its own vhost and enables Caddy

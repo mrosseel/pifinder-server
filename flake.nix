@@ -34,6 +34,9 @@
             filter = path: _type: builtins.baseNameOf path != "target";
           };
           cargoLock.lockFile = ./differ/Cargo.lock;
+          # See modules/pifinder-differ.nix: rusqlite links the sqlite of nixpkgs.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.sqlite ];
         };
         default = pifinder-differ;
       });

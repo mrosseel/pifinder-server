@@ -42,6 +42,10 @@ let
       filter = path: _type: builtins.baseNameOf path != "target";
     };
     cargoLock.lockFile = ../differ/Cargo.lock;
+    # The nixpkgs Rust hook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1, so rusqlite
+    # links the sqlite of nixpkgs and not its bundled copy.
+    nativeBuildInputs = [ pkgs.pkg-config ];
+    buildInputs = [ pkgs.sqlite ];
   };
 in
 {
